@@ -67,6 +67,19 @@ ANNUAL_INCOME_OPTIONS = (
     "over $1,000,000 per year",
 )
 
+OCCUPATION_OPTIONS = (
+    "Accountant", "Attorney", "Banker", "Business Owner", "C-Level Executive",
+    "Consultant", "Dentist", "Engineer", "Entrepreneur", "Farmer / Rancher",
+    "Financial Advisor", "Government Employee", "Healthcare Professional",
+    "Homemaker", "Insurance Professional", "Investor", "IT Professional",
+    "Marketing / Sales", "Military", "Nurse", "Pharmacist", "Physician",
+    "Pilot", "Professor / Teacher", "Real Estate Professional", "Retired",
+    "Scientist", "Software Developer", "Student", "Trades / Construction",
+    "Venture Capital / Private Equity", "Not Employed", "Other",
+)
+
+ELIGIBILITY_WARNING_TEXT = "Not eligible for private secondary transactions."
+
 INVESTMENT_OBJECTIVE_OPTIONS = (
     "generate income",
     "liquidate assets",
@@ -166,9 +179,11 @@ FIELD_LABELS = {
     "crd_number": "CRD#",
     "missing_info_notes": "Missing Information Notes",
     "occupation": "Occupation",
+    "occupation_other": "Other Occupation",
     "employer_name": "Employer Name",
     "employer_city": "Employer City",
     "employer_state": "Employer State/Province",
+    "employer_zip": "Employer Postal/Zip",
     "employer_country": "Employer Country",
     "retiring_five_years": "Planning to Retire Within 5 Years",
     "net_worth": "Net Worth Excluding Primary Residence",
@@ -195,7 +210,8 @@ DETAIL_FIELD_ORDER = [
     "address_zip", "address_country",
     "client_phone", "client_email", "tax_id", "date_of_birth",
     "associated_person", "crd_number", "missing_info_notes",
-    "occupation", "employer_name", "employer_city", "employer_state", "employer_country",
+    "occupation", "occupation_other", "employer_name", "employer_country",
+    "employer_city", "employer_state", "employer_zip",
     "retiring_five_years", "net_worth", "cumulative_investments",
     "annual_income", "investment_objectives", "other_objective",
     "previous_investment_types", "years_experience",
@@ -281,6 +297,11 @@ details.patriot-section p { margin: 12px 0; }
 }
 .id-upload-notice-icon { font-size: 17px; flex-shrink: 0; }
 .id-upload-notice.highlight { box-shadow: 0 0 0 3px rgba(185, 151, 91, 0.35); }
+.eligibility-warning {
+  border: 1px solid #c0392b; background: #fdecea; color: #c0392b; font-weight: 700;
+  padding: 10px 14px; border-radius: 4px; margin-top: 8px; font-size: 13px;
+}
+.not-eligible-tag { color: #c0392b; font-weight: 700; font-size: 11px; margin-left: 6px; white-space: nowrap; }
 .nav-buttons { display: flex; justify-content: space-between; margin-top: 32px; }
 .step { display: none; }
 .step.active { display: block; }
@@ -323,16 +344,11 @@ SHARED_HEADER = """
 """
 
 
-def build_radio_options_html(name, options, checked_value=None):
-    parts = []
-    for i, opt in enumerate(options):
-        input_id = f"{name}_{i}"
-        checked = " checked" if opt == checked_value else ""
+def build_select_options_html(options, placeholder):
+    parts = [f"<option value=''>{html.escape(placeholder)}</option>"]
+    for opt in options:
         esc = html.escape(opt)
-        parts.append(
-            f"<label class='radio-option' for='{input_id}'>"
-            f"<input type='radio' id='{input_id}' name='{name}' value='{esc}'{checked}> {esc}</label>"
-        )
+        parts.append(f"<option value='{esc}'>{esc}</option>")
     return "".join(parts)
 
 
@@ -369,9 +385,10 @@ def build_country_options_html(default="United States"):
     return "".join(parts)
 
 
-NET_WORTH_RADIOS_HTML = build_radio_options_html("net_worth", NET_WORTH_OPTIONS)
-CUMULATIVE_RADIOS_HTML = build_radio_options_html("cumulative_investments", NET_WORTH_OPTIONS)
-ANNUAL_INCOME_CHECKS_HTML = build_checkbox_options_html("annual_income", ANNUAL_INCOME_OPTIONS)
+NET_WORTH_SELECT_HTML = build_select_options_html(NET_WORTH_OPTIONS, "Select…")
+CUMULATIVE_SELECT_HTML = build_select_options_html(NET_WORTH_OPTIONS, "Select…")
+ANNUAL_INCOME_SELECT_HTML = build_select_options_html(ANNUAL_INCOME_OPTIONS, "Select…")
+OCCUPATION_OPTIONS_HTML = build_select_options_html(OCCUPATION_OPTIONS, "Select occupation…")
 INVESTMENT_OBJECTIVES_CHECKS_HTML = build_checkbox_options_html("investment_objectives", INVESTMENT_OBJECTIVE_OPTIONS)
 PREVIOUS_INVESTMENT_CHECKS_HTML = build_checkbox_options_html("previous_investment_types", PREVIOUS_INVESTMENT_OPTIONS)
 SOPHISTICATION_CHECKS_HTML = build_checkbox_options_html("client_sophistication", SOPHISTICATION_OPTIONS)
@@ -571,7 +588,12 @@ __HEADER__
 
         <div class="field" data-field="occupation">
           <label class="field-label" for="occupation">Occupation</label>
-          <input type="text" id="occupation" name="occupation">
+          <select id="occupation" name="occupation">__OCCUPATION_OPTIONS__</select>
+          <div id="occupation-other-field" style="display:none; margin-top:10px;">
+            <label class="field-label" for="occupation_other">Other Occupation</label>
+            <input type="text" id="occupation_other" name="occupation_other">
+            <div class="field-error"></div>
+          </div>
         </div>
         <div class="field" data-field="employer_name">
           <label class="field-label" for="employer_name">Name of Employer</label>
@@ -579,19 +601,25 @@ __HEADER__
         </div>
 
         <h3>Address of Employer</h3>
+        <div class="field" data-field="employer_country">
+          <label class="field-label" for="employer_country">Country</label>
+          <select id="employer_country" name="employer_country">__COUNTRY_OPTIONS__</select>
+        </div>
         <div class="two-col">
           <div class="field" data-field="employer_city">
             <label class="field-label" for="employer_city">City</label>
             <input type="text" id="employer_city" name="employer_city">
           </div>
-          <div class="field" data-field="employer_state">
+          <div class="field" data-field="employer_state" id="employer_state_wrap">
             <label class="field-label" for="employer_state">State/Province</label>
             <input type="text" id="employer_state" name="employer_state">
           </div>
         </div>
-        <div class="field" data-field="employer_country">
-          <label class="field-label" for="employer_country">Country</label>
-          <select id="employer_country" name="employer_country">__COUNTRY_OPTIONS__</select>
+        <div class="field" data-field="employer_zip" id="employer_zip_wrap">
+          <label class="field-label" for="employer_zip">Postal/Zip Code</label>
+          <input type="text" id="employer_zip" name="employer_zip">
+          <div class="helper-text" id="employer-zip-helper" style="display:none;">Format: 12345 or 12345-6789</div>
+          <div class="field-error"></div>
         </div>
 
         <div class="field" data-field="retiring_five_years">
@@ -600,20 +628,22 @@ __HEADER__
         </div>
 
         <div class="field" data-field="net_worth">
-          <label class="field-label">Net Worth Excluding Primary Residence</label>
-          __NET_WORTH_RADIOS__
+          <label class="field-label" for="net_worth">Net Worth Excluding Primary Residence</label>
+          <select id="net_worth" name="net_worth">__NET_WORTH_SELECT__</select>
+          <div class="eligibility-warning" id="net_worth-warning" style="display:none;">Not eligible for private secondary transactions.</div>
           <div class="field-error"></div>
         </div>
 
         <div class="field" data-field="cumulative_investments">
-          <label class="field-label">Cumulative Amount of Investments</label>
-          __CUMULATIVE_RADIOS__
+          <label class="field-label" for="cumulative_investments">Cumulative Amount of Investments</label>
+          <select id="cumulative_investments" name="cumulative_investments">__CUMULATIVE_SELECT__</select>
+          <div class="eligibility-warning" id="cumulative_investments-warning" style="display:none;">Not eligible for private secondary transactions.</div>
           <div class="field-error"></div>
         </div>
 
         <div class="field" data-field="annual_income">
-          <label class="field-label">Annual Income (check all that apply)</label>
-          __ANNUAL_INCOME_CHECKS__
+          <label class="field-label" for="annual_income">Annual Income</label>
+          <select id="annual_income" name="annual_income">__ANNUAL_INCOME_SELECT__</select>
         </div>
 
         <div class="field" data-field="investment_objectives">
@@ -709,7 +739,7 @@ __HEADER__
     client_phone: 2, client_email: 2, tax_id: 2, date_of_birth: 2,
     associated_person: 2, crd_number: 2,
     net_worth: 3, cumulative_investments: 3, other_objective: 3, sophistication_other: 3,
-    years_experience: 3,
+    occupation_other: 3, employer_zip: 3, years_experience: 3,
     q_private_equity_five_years: 3, q_illiquid_investments: 3, q_risk_tolerance: 3,
     q_independent_judgement: 3, attestation: 3
   };
@@ -845,8 +875,19 @@ __HEADER__
 
   function validateStep3() {
     var ok = true;
-    if (!qs('input[name="net_worth"]:checked')) { showFieldError("net_worth", "Please select an option."); ok = false; } else { clearFieldError("net_worth"); }
-    if (!qs('input[name="cumulative_investments"]:checked')) { showFieldError("cumulative_investments", "Please select an option."); ok = false; } else { clearFieldError("cumulative_investments"); }
+    if (!qs("#net_worth").value) { showFieldError("net_worth", "Please select an option."); ok = false; } else { clearFieldError("net_worth"); }
+    if (!qs("#cumulative_investments").value) { showFieldError("cumulative_investments", "Please select an option."); ok = false; } else { clearFieldError("cumulative_investments"); }
+
+    if (qs("#occupation").value === "Other" && !qs("#occupation_other").value.trim()) {
+      showFieldError("occupation_other", "Describe the Client's occupation."); ok = false;
+    } else { clearFieldError("occupation_other"); }
+
+    var employerZipWrap = qs("#employer_zip_wrap");
+    var employerZipVisible = employerZipWrap && employerZipWrap.style.display !== "none";
+    var employerZip = qs("#employer_zip") ? qs("#employer_zip").value.trim() : "";
+    if (employerZipVisible && employerZip && !/^\d{5}(-\d{4})?$/.test(employerZip)) {
+      showFieldError("employer_zip", "Enter a valid US zip code (12345 or 12345-6789)."); ok = false;
+    } else { clearFieldError("employer_zip"); }
 
     var objOther = qs('input[name="investment_objectives"][value="Other"]');
     if (objOther && objOther.checked && !qs("#other_objective").value.trim()) {
@@ -1039,40 +1080,7 @@ __HEADER__
     "Virginia", "Washington", "West Virginia", "Wisconsin", "Wyoming"
   ];
 
-  function rebuildStateField(preserveValue) {
-    var old = qs("#address_state");
-    var val = preserveValue !== undefined ? preserveValue : old.value;
-    var country = qs("#address_country").value;
-    var el;
-    if (isUSCountry(country)) {
-      el = document.createElement("select");
-      var optsHtml = '<option value="">Select State</option>';
-      US_STATES.forEach(function (s) {
-        optsHtml += "<option value='" + s + "'" + (s === val ? " selected" : "") + ">" + s + "</option>";
-      });
-      el.innerHTML = optsHtml;
-    } else {
-      el = document.createElement("input");
-      el.type = "text";
-      el.value = US_STATES.indexOf(val) === -1 ? val : "";
-    }
-    el.id = "address_state";
-    el.name = "address_state";
-    old.parentNode.replaceChild(el, old);
-  }
-
-  function updateZipHelper() {
-    qs("#zip-helper").style.display = isUSCountry(qs("#address_country").value) ? "block" : "none";
-  }
-
-  qs("#address_country").addEventListener("change", function () {
-    rebuildStateField();
-    updateZipHelper();
-    clearFieldError("address_state");
-    clearFieldError("address_zip");
-  });
-
-  function autofillFromZip(zip) {
+  function autofillFromZip(zip, cfg) {
     var hasAbort = typeof AbortController !== "undefined";
     var controller = hasAbort ? new AbortController() : null;
     var timeoutId = setTimeout(function () { if (controller) controller.abort(); }, 3000);
@@ -1082,32 +1090,113 @@ __HEADER__
         clearTimeout(timeoutId);
         var place = data && data.places && data.places[0];
         if (!place) return;
-        if (place["place name"]) {
-          qs("#address_city").value = place["place name"];
-          clearFieldError("address_city");
+        if (place["place name"] && cfg.cityId) {
+          var cityEl = qs("#" + cfg.cityId);
+          if (cityEl) { cityEl.value = place["place name"]; clearFieldError(cfg.cityId); }
         }
         if (place["state"]) {
-          var stateEl = qs("#address_state");
-          if (stateEl) {
-            stateEl.value = place["state"];
-            clearFieldError("address_state");
-          }
+          var stateEl = qs("#" + cfg.stateId);
+          if (stateEl) { stateEl.value = place["state"]; clearFieldError(cfg.stateId); }
         }
       })
       .catch(function () { clearTimeout(timeoutId); });
   }
 
-  var zipDebounce = null;
-  qs("#address_zip").addEventListener("input", function () {
-    if (!isUSCountry(qs("#address_country").value)) return;
-    var val = qs("#address_zip").value.trim();
-    if (!/^\d{5}$/.test(val)) return;
-    if (zipDebounce) { clearTimeout(zipDebounce); }
-    zipDebounce = setTimeout(function () { autofillFromZip(val); }, 300);
+  // Reusable country/state/zip behavior, shared by the client address (Step 2)
+  // and the employer address (Step 3): US selection turns State into a
+  // 50-state+DC dropdown and validates Zip as 5 or 5+4 digits, with a
+  // best-effort City/State autofill from a 5-digit zip; non-US keeps free
+  // text (and, when configured, hides the Zip field entirely).
+  function setupAddressBlock(cfg) {
+    function rebuildState(preserveValue) {
+      var old = qs("#" + cfg.stateId);
+      var val = preserveValue !== undefined ? preserveValue : old.value;
+      var country = qs("#" + cfg.countryId).value;
+      var el;
+      if (isUSCountry(country)) {
+        el = document.createElement("select");
+        var optsHtml = '<option value="">Select State</option>';
+        US_STATES.forEach(function (s) {
+          optsHtml += "<option value='" + s + "'" + (s === val ? " selected" : "") + ">" + s + "</option>";
+        });
+        el.innerHTML = optsHtml;
+      } else {
+        el = document.createElement("input");
+        el.type = "text";
+        el.value = US_STATES.indexOf(val) === -1 ? val : "";
+      }
+      el.id = cfg.stateId;
+      el.name = cfg.stateId;
+      old.parentNode.replaceChild(el, old);
+    }
+
+    function updateZipVisibility() {
+      var isUS = isUSCountry(qs("#" + cfg.countryId).value);
+      if (cfg.zipHelperId) {
+        var helper = qs("#" + cfg.zipHelperId);
+        if (helper) { helper.style.display = isUS ? "block" : "none"; }
+      }
+      if (cfg.hideZipWhenNonUS && cfg.zipWrapId) {
+        var wrap = qs("#" + cfg.zipWrapId);
+        if (wrap) {
+          wrap.style.display = isUS ? "block" : "none";
+          if (!isUS && cfg.zipId) { qs("#" + cfg.zipId).value = ""; clearFieldError(cfg.zipId); }
+        }
+      }
+    }
+
+    qs("#" + cfg.countryId).addEventListener("change", function () {
+      rebuildState();
+      updateZipVisibility();
+      clearFieldError(cfg.stateId);
+      if (cfg.zipId) { clearFieldError(cfg.zipId); }
+    });
+
+    if (cfg.zipId) {
+      var zipDebounce = null;
+      qs("#" + cfg.zipId).addEventListener("input", function () {
+        if (!isUSCountry(qs("#" + cfg.countryId).value)) return;
+        var val = qs("#" + cfg.zipId).value.trim();
+        if (!/^\d{5}$/.test(val)) return;
+        if (zipDebounce) { clearTimeout(zipDebounce); }
+        zipDebounce = setTimeout(function () { autofillFromZip(val, cfg); }, 300);
+      });
+    }
+
+    rebuildState();
+    updateZipVisibility();
+  }
+
+  setupAddressBlock({
+    countryId: "address_country", stateId: "address_state", zipId: "address_zip",
+    zipHelperId: "zip-helper", cityId: "address_city", hideZipWhenNonUS: false
+  });
+  setupAddressBlock({
+    countryId: "employer_country", stateId: "employer_state", zipId: "employer_zip",
+    zipWrapId: "employer_zip_wrap", zipHelperId: "employer-zip-helper", cityId: "employer_city",
+    hideZipWhenNonUS: true
   });
 
-  rebuildStateField();
-  updateZipHelper();
+  var occupationSelect = qs("#occupation");
+  if (occupationSelect) {
+    occupationSelect.addEventListener("change", function () {
+      var wrap = qs("#occupation-other-field");
+      var isOther = occupationSelect.value === "Other";
+      wrap.style.display = isOther ? "block" : "none";
+      if (!isOther) { qs("#occupation_other").value = ""; clearFieldError("occupation_other"); }
+    });
+  }
+
+  function bindEligibilityWarning(selectId) {
+    var select = qs("#" + selectId);
+    var warning = qs("#" + selectId + "-warning");
+    if (!select || !warning) return;
+    select.addEventListener("change", function () {
+      warning.style.display = select.value === "NONE OF THE ABOVE" ? "block" : "none";
+    });
+  }
+  bindEligibilityWarning("net_worth");
+  bindEligibilityWarning("cumulative_investments");
 
   goToStep(1);
 })();
@@ -1142,9 +1231,10 @@ def render_form_page():
     page = page.replace("__HEADER__", SHARED_HEADER)
     page = page.replace("__COUNTRY_OPTIONS__", COUNTRY_OPTIONS_HTML)
     page = page.replace("__RETIRING_RADIOS__", RETIRING_RADIOS_HTML)
-    page = page.replace("__NET_WORTH_RADIOS__", NET_WORTH_RADIOS_HTML)
-    page = page.replace("__CUMULATIVE_RADIOS__", CUMULATIVE_RADIOS_HTML)
-    page = page.replace("__ANNUAL_INCOME_CHECKS__", ANNUAL_INCOME_CHECKS_HTML)
+    page = page.replace("__OCCUPATION_OPTIONS__", OCCUPATION_OPTIONS_HTML)
+    page = page.replace("__NET_WORTH_SELECT__", NET_WORTH_SELECT_HTML)
+    page = page.replace("__CUMULATIVE_SELECT__", CUMULATIVE_SELECT_HTML)
+    page = page.replace("__ANNUAL_INCOME_SELECT__", ANNUAL_INCOME_SELECT_HTML)
     page = page.replace("__INVESTMENT_OBJECTIVES_CHECKS__", INVESTMENT_OBJECTIVES_CHECKS_HTML)
     page = page.replace("__PREVIOUS_INVESTMENT_CHECKS__", PREVIOUS_INVESTMENT_CHECKS_HTML)
     page = page.replace("__SOPHISTICATION_CHECKS__", SOPHISTICATION_CHECKS_HTML)
@@ -1349,12 +1439,43 @@ def validate_submission(raw):
     opt_text("missing_info_notes", max_len=4000)
 
     # Step 3
-    opt_text("occupation")
+    occupation = str(raw.get("occupation", "")).strip()
+    if occupation:
+        if occupation not in OCCUPATION_OPTIONS:
+            errors["occupation"] = "Select a valid occupation."
+        else:
+            data["occupation"] = occupation
+            if occupation == "Other":
+                occupation_other = str(raw.get("occupation_other", "")).strip()
+                if not occupation_other:
+                    errors["occupation_other"] = "Describe the Client's occupation."
+                else:
+                    data["occupation_other"] = occupation_other[:200]
+
     opt_text("employer_name")
-    opt_text("employer_city")
-    opt_text("employer_state")
+
+    employer_country = None
     if not is_blank(raw.get("employer_country")):
-        data["employer_country"] = str(raw.get("employer_country")).strip()
+        employer_country = str(raw.get("employer_country")).strip()
+        data["employer_country"] = employer_country
+
+    opt_text("employer_city")
+
+    employer_state = str(raw.get("employer_state", "")).strip()
+    if employer_state:
+        if employer_country == "United States" and employer_state not in US_STATES:
+            errors["employer_state"] = "Select a valid US state."
+        else:
+            data["employer_state"] = employer_state
+
+    if employer_country == "United States":
+        employer_zip = str(raw.get("employer_zip", "")).strip()
+        if employer_zip:
+            if not US_ZIP_RE.match(employer_zip):
+                errors["employer_zip"] = "Enter a valid US zip code (12345 or 12345-6789)."
+            else:
+                data["employer_zip"] = employer_zip
+    # employer_zip is never stored when the employer's country is not US.
 
     retiring = raw.get("retiring_five_years")
     if retiring in YES_NO:
@@ -1372,7 +1493,16 @@ def validate_submission(raw):
     else:
         data["cumulative_investments"] = cumulative
 
-    opt_checklist("annual_income", ANNUAL_INCOME_OPTIONS)
+    if data.get("net_worth") == "NONE OF THE ABOVE" or data.get("cumulative_investments") == "NONE OF THE ABOVE":
+        data["eligibility_warning"] = True
+
+    annual_income = str(raw.get("annual_income", "")).strip()
+    if annual_income:
+        if annual_income not in ANNUAL_INCOME_OPTIONS:
+            errors["annual_income"] = "Select a valid annual income range."
+        else:
+            data["annual_income"] = annual_income
+
     opt_checklist("investment_objectives", INVESTMENT_OBJECTIVE_OPTIONS)
     if "Other" in data.get("investment_objectives", []):
         other_obj = str(raw.get("other_objective", "")).strip()
@@ -1556,13 +1686,16 @@ def render_admin_list(admin_key):
         sid = str(it.get("submission_id", ""))
         date_str = str(it.get("created_at", ""))[:19].replace("T", " ")
         name = f"{it.get('client_first_name', '')} {it.get('client_last_name', '')}".strip()
+        name_html = html.escape(name)
+        if it.get("eligibility_warning"):
+            name_html += " <span class='not-eligible-tag'>&#9888; NOT ELIGIBLE</span>"
         email = str(it.get("client_email", ""))
         agent = str(it.get("agent_email", ""))
         detail_url = f"/?view=admin&key={quote(admin_key)}&id={quote(sid)}"
         rows.append(
             "<tr>"
             f"<td>{html.escape(date_str)}</td>"
-            f"<td>{html.escape(name)}</td>"
+            f"<td>{name_html}</td>"
             f"<td>{html.escape(email)}</td>"
             f"<td>{html.escape(agent)}</td>"
             f"<td><a class='detail-link' href='{html.escape(detail_url)}'>Detail</a></td>"
@@ -1602,7 +1735,7 @@ def render_admin_detail(submission_id, admin_key):
             f"<div class='detail-value'>{html.escape(value_str)}</div></div>"
         )
     for key, value in item.items():
-        if key in seen or key in ("id_upload_s3_key", "id_upload_status"):
+        if key in seen or key in ("id_upload_s3_key", "id_upload_status", "eligibility_warning"):
             continue
         label = FIELD_LABELS.get(key, key.replace("_", " ").title())
         rows_html.append(
@@ -1630,10 +1763,15 @@ def render_admin_detail(submission_id, admin_key):
     elif item.get("id_upload_status") == ID_UPLOAD_STATUS_DEFERRED:
         upload_html = "<p>ID document: handled via RMS secure transfer</p>"
 
+    warning_html = ""
+    if item.get("eligibility_warning"):
+        warning_html = f"<div class='eligibility-warning'>&#9888; {html.escape(ELIGIBILITY_WARNING_TEXT)}</div>"
+
     back_url = f"/?view=admin&key={quote(admin_key)}"
     content = (
         f"<p><a class='detail-link' href='{html.escape(back_url)}'>&larr; Back to submissions</a></p>"
         "<h1>Submission Detail</h1>"
+        f"{warning_html}"
         f"<div class='id-section'><h2>Identity Document</h2>{upload_html}</div>"
         f"<div class='detail-grid'>{''.join(rows_html)}</div>"
     )
