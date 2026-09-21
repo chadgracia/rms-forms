@@ -21,6 +21,11 @@ SES_SENDER = "RMS Forms <agent@agent.graciagroup.com>"
 SES_REPLY_TO = "cgracia@rainmakersecurities.com"
 AGENT_EMAIL_DOMAIN = "@rainmakersecurities.com"
 RMS_TEAM_EMAIL = "ops@rainmakersecurities.com"
+# Global email kill switch (test phase): absent/anything-but-"true" means NO
+# email of any kind is sent -- every ses.send_* call site checks this first.
+# Set EMAILS_ENABLED=true in the Lambda's environment variables to turn
+# emails back on; no code change needed.
+EMAILS_ENABLED = os.environ.get("EMAILS_ENABLED", "").lower() == "true"
 # Set on the Lambda alongside ADMIN_KEY so sweep emails (which have no HTTP
 # request to derive a host from) can still build a clickable admin link,
 # e.g. "xxxxxxxx.lambda-url.us-east-1.on.aws". Falls back gracefully if unset.
@@ -3027,23 +3032,26 @@ def handle_feature_request_create(body, ip, host):
             500,
         )
 
-    try:
-        admin_link = build_admin_link(host=host)
-        lines = [text, "", f"Page: {page or '-'}"]
-        if admin_link:
-            lines.append("")
-            lines.append(admin_link)
-        ses.send_email(
-            Source=SES_SENDER,
-            Destination={"ToAddresses": [SES_REPLY_TO]},
-            Message={
-                "Subject": {"Data": "RMS Forms feature request"},
-                "Body": {"Text": {"Data": "\n".join(lines) + "\n"}},
-            },
-            ReplyToAddresses=[SES_REPLY_TO],
-        )
-    except Exception:
-        print(f"route=feature_request status=email_failed request_id={request_id}")
+    if not EMAILS_ENABLED:
+        print("route=feature_request status=emails_disabled")
+    else:
+        try:
+            admin_link = build_admin_link(host=host)
+            lines = [text, "", f"Page: {page or '-'}"]
+            if admin_link:
+                lines.append("")
+                lines.append(admin_link)
+            ses.send_email(
+                Source=SES_SENDER,
+                Destination={"ToAddresses": [SES_REPLY_TO]},
+                Message={
+                    "Subject": {"Data": "RMS Forms feature request"},
+                    "Body": {"Text": {"Data": "\n".join(lines) + "\n"}},
+                },
+                ReplyToAddresses=[SES_REPLY_TO],
+            )
+        except Exception:
+            print(f"route=feature_request status=email_failed request_id={request_id}")
 
     print(f"route=feature_request status=200 request_id={request_id}")
     return response_json({"ok": True, "id": request_id})
@@ -3137,6 +3145,10 @@ def pdf_attachment_filename(item, submission_id, variant):
 
 
 def send_submission_emails(item, submission_id, host):
+    if not EMAILS_ENABLED:
+        print("route=submit status=emails_disabled")
+        return
+
     client_first = item.get("client_first_name", "")
     client_last = item.get("client_last_name", "")
     client_ref = client_last or client_first or "Client"
@@ -3316,6 +3328,9 @@ def _parse_iso_datetime(value):
 
 
 def send_partial_notification_email(item):
+    if not EMAILS_ENABLED:
+        print("route=sweep status=emails_disabled")
+        return
     agent_email = str(item.get("agent_email", "")).strip()
     if not agent_email or not agent_email.lower().endswith(AGENT_EMAIL_DOMAIN):
         return
@@ -3395,6 +3410,13 @@ def handle_sweep():
             if not created_dt or (now - created_dt) > DRAFT_NOTIFY_WITHIN:
                 continue
 
+            # Emails disabled: leave this partial un-notified (no send, no
+            # notified flag) so it's picked up for real once EMAILS_ENABLED
+            # is turned back on. The 30-day delete branch above is
+            # unaffected -- cleanup still runs either way.
+            if not EMAILS_ENABLED:
+                continue
+
             send_partial_notification_email(item)
             try:
                 table.update_item(
@@ -3409,6 +3431,8 @@ def handle_sweep():
             errors += 1
             continue
 
+    if not EMAILS_ENABLED:
+        print("route=sweep status=emails_disabled")
     print(f"route=sweep status=200 notified={notified} deleted={deleted} errors={errors}")
     return {"ok": True, "notified": notified, "deleted": deleted, "errors": errors}
 
