@@ -1249,6 +1249,84 @@ FORM_HTML = render_form_page()
 ADMIN_PAGE_RENDERED = ADMIN_PAGE_TEMPLATE.replace("__SHARED_CSS__", SHARED_CSS).replace("__HEADER__", SHARED_HEADER)
 
 
+# ---------------------------------------------------------------------------
+# Reviewer margin notes ("Glen notes") — only ever rendered when the request
+# carries ?notes=glen. FORM_HTML above is untouched by any of this; the
+# annotated page is a separate string built from it, so a request without
+# that query param gets back byte-for-byte the exact same page it always did.
+# ---------------------------------------------------------------------------
+
+GLEN_NOTE_TEXTS = {
+    1: "Glen: You're viewing the annotated version — these margin notes appear only on this private preview link. Clients see a clean form with none of this.",
+    2: "Glen: These now prefill and lock automatically based on which RMS agent sent the client the form — each agent gets a personal link. Every submission arrives correctly attributed; no more blank or misspelled agent fields.",
+    3: "Glen: File upload intentionally not implemented yet — I'll wire it up once RMS tells me where these documents should live. My opinion: a copy of the ID should NOT be sent to agents by email, as happens today. The agent should receive the form data stripped of the ID, with the ID going only to RMS safekeeping.",
+    4: "Glen: Country now comes first and drives the rest: US clients get a proper state dropdown, the form pre-populates city and state from the zip code, and zip code errors are disallowed at entry. Bad addresses can no longer reach us.",
+    5: "Glen: Every identification field is now required and format-checked before the client can advance — fewer incomplete forms, fewer repeat requests back to the client.",
+    6: "Glen: Occupation is now a standardized dropdown with an Other option. Today we get free text — real examples from our files: 'VC', 'Real Estate', 'N/A' — which makes the data inconsistent and hard to use.",
+    7: "Glen: It's not possible to have more than one net worth, so I switched these from check-all-that-apply to single-choice dropdowns. Same for annual income. One clean answer per question.",
+    8: "Glen: If a client selects NONE OF THE ABOVE for net worth or investments, they see an immediate eligibility warning and the submission is flagged in the admin view — we catch unqualified clients at the door instead of after the paperwork.",
+    9: "Glen: Everything on this form is validated the moment it's typed, and the whole thing is re-checked on our server before it's stored — so what lands in the database is complete, consistent, and correctly attributed on the first pass.",
+}
+
+# Each entry: (note number, unique anchor substring already present in
+# FORM_HTML, "before"/"after" the anchor). Anchors are existing markup, not
+# markers added to the template, so the base page never carries any trace.
+GLEN_NOTE_ANCHORS = [
+    (1, '<ol class="instructions-list">', "before"),
+    (2, '<div class="two-col">\n          <div class="field" data-field="agent_first_name">', "before"),
+    (3, '<div class="field">\n          <label class="field-label">Identity Verification Upload</label>', "before"),
+    (4, '<h3>Address of Client</h3>', "after"),
+    (5, '<div class="two-col">\n          <div class="field" data-field="client_phone">', "before"),
+    (6, '<div class="field" data-field="occupation">', "before"),
+    (7, '<div class="field" data-field="net_worth">', "before"),
+    (8, '<div class="field" data-field="cumulative_investments">', "before"),
+    (9, '<div class="field" data-field="attestation">', "before"),
+]
+
+GLEN_NOTES_CSS = """
+#form-wrap { position: relative; }
+.glen-note {
+  background: #faf6ee; border: 1px solid #b9975b; color: #1b2a4a;
+  font-size: 12.5px; line-height: 1.5; padding: 10px 12px; border-radius: 4px;
+  margin: 14px 0; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+.glen-note-label {
+  display: block; font-size: 10px; font-weight: 700; letter-spacing: 0.6px;
+  color: #b9975b; text-transform: uppercase; margin-bottom: 4px;
+}
+@media (min-width: 1100px) {
+  .container { max-width: 1040px; }
+  #form-wrap { max-width: 760px; }
+  .glen-note { position: absolute; left: 100%; margin-left: 24px; width: 260px; margin-top: -4px; }
+}
+"""
+
+
+def build_glen_note_html(note_number):
+    text = html.escape(GLEN_NOTE_TEXTS[note_number])
+    return (
+        f"<div class='glen-note' data-glen-note='{note_number}'>"
+        f"<span class='glen-note-label'>GLEN &mdash;</span>{text}"
+        f"</div>"
+    )
+
+
+def build_form_html_with_glen_notes():
+    page = FORM_HTML
+    for number, anchor, position in GLEN_NOTE_ANCHORS:
+        if page.count(anchor) != 1:
+            continue
+        note_html = build_glen_note_html(number)
+        replacement = (note_html + anchor) if position == "before" else (anchor + note_html)
+        page = page.replace(anchor, replacement, 1)
+    if "</style>" in page:
+        page = page.replace("</style>", GLEN_NOTES_CSS + "</style>", 1)
+    return page
+
+
+FORM_HTML_WITH_GLEN_NOTES = build_form_html_with_glen_notes()
+
+
 def wrap_admin_page(content):
     return ADMIN_PAGE_RENDERED.replace("__CONTENT__", content)
 
@@ -1809,6 +1887,8 @@ def lambda_handler(event, context):
             if params.get("view") == "admin":
                 return handle_admin(params, host)
             print("route=form status=200")
+            if params.get("notes") == "glen":
+                return response_html(FORM_HTML_WITH_GLEN_NOTES)
             return response_html(FORM_HTML)
 
         if method == "POST":
