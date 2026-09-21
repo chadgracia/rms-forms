@@ -15,5 +15,8 @@ jobs:
           role-to-assume: arn:aws:iam::271378210266:role/github-actions-deploy
           aws-region: us-east-1
       - run: |
-          zip -j function.zip lambda_function.py
+          mkdir -p build
+          pip install fpdf2 -t build
+          cp lambda_function.py build/
+          cd build && zip -r ../function.zip . && cd ..
           aws lambda update-function-code --function-name rms-forms --zip-file fileb://function.zip

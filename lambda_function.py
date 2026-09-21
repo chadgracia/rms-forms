@@ -5,11 +5,15 @@ import json
 import os
 import re
 import uuid
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from urllib.parse import parse_qs, quote
 
 import boto3
 from boto3.dynamodb.conditions import Attr
 from botocore.exceptions import ClientError
+from fpdf import FPDF
 
 REGION = "us-east-1"
 TABLE_NAME = "rms-forms"
@@ -17,9 +21,20 @@ BUCKET_NAME = "rms-forms-uploads-271378210266"
 SES_SENDER = "RMS Forms <agent@agent.graciagroup.com>"
 SES_REPLY_TO = "cgracia@rainmakersecurities.com"
 AGENT_EMAIL_DOMAIN = "@rainmakersecurities.com"
+RMS_TEAM_EMAIL = "ops@rainmakersecurities.com"
+# Set on the Lambda alongside ADMIN_KEY so sweep emails (which have no HTTP
+# request to derive a host from) can still build a clickable admin link,
+# e.g. "xxxxxxxx.lambda-url.us-east-1.on.aws". Falls back gracefully if unset.
+FORM_HOST_ENV_VAR = "FORM_HOST"
 FORM_TYPE_CEF_NATURAL = "cef-natural"
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 RATE_LIMIT_PER_HOUR = 20
+DRAFT_STATUS_PARTIAL = "partial"
+SUBMISSION_STATUS_COMPLETE = "complete"
+DRAFT_MAX_BYTES = 50 * 1024
+DRAFT_NOTIFY_AFTER = datetime.timedelta(hours=2)
+DRAFT_NOTIFY_WITHIN = datetime.timedelta(days=7)
+DRAFT_DELETE_AFTER = datetime.timedelta(days=30)
 
 ALLOWED_UPLOAD_EXTENSIONS = {
     "jpg": ("image/jpeg", "image/jpg"),
@@ -228,7 +243,10 @@ COUNTRIES = (
 FIELD_LABELS = {
     "submission_id": "Submission ID",
     "form_type": "Form Type",
+    "status": "Status",
+    "last_step": "Last Step Reached",
     "created_at": "Submitted (UTC)",
+    "updated_at": "Last Updated (UTC)",
     "ip": "IP Address",
     "confirm_read": "Confirmed Read Disclosures",
     "agent_first_name": "Referring Agent First Name",
@@ -274,7 +292,7 @@ FIELD_LABELS = {
 }
 
 DETAIL_FIELD_ORDER = [
-    "submission_id", "form_type", "created_at", "ip",
+    "submission_id", "form_type", "status", "last_step", "created_at", "updated_at", "ip",
     "agent_first_name", "agent_last_name", "agent_email", "confirm_read",
     "client_first_name", "client_last_name",
     "address_street", "address_street2", "address_city", "address_state",
@@ -373,6 +391,10 @@ details.patriot-section p { margin: 12px 0; }
   padding: 10px 14px; border-radius: 4px; margin-top: 8px; font-size: 13px;
 }
 .not-eligible-tag { color: #c0392b; font-weight: 700; font-size: 11px; margin-left: 6px; white-space: nowrap; }
+.partial-tag {
+  color: #8a5a00; background: #fdf3e0; border: 1px solid #c77d00; font-weight: 700;
+  font-size: 11px; margin-left: 6px; padding: 1px 6px; border-radius: 3px; white-space: nowrap;
+}
 #employer-address-block.address-block-disabled { opacity: 0.45; pointer-events: none; }
 .agent-typeahead { position: relative; }
 .agent-suggestions {
@@ -581,16 +603,6 @@ __HEADER__
       <!-- STEP 2 -->
       <div class="step" data-step="2">
         <h2>Client Identification</h2>
-
-        <div class="field">
-          <label class="field-label">Identity Verification Upload</label>
-          <p class="helper-text">Upload a government issued photo ID of the Client. If this cannot be obtained, upload a text narrative that documents the circumstances of the Client's refusal, neglect, or inability to provide the requested document. Note that if we cannot verify a Client's identity in some manner, we cannot legally transact with the Client.</p>
-          <button type="button" class="btn" id="upload-id-btn">Upload ID Document</button>
-          <div class="id-upload-notice" id="id-upload-notice">
-            <span class="id-upload-notice-icon">&#128274;</span>
-            <span><strong>Identity verification is required by federal law.</strong> Under the USA PATRIOT Act and U.S. Treasury regulations (31 CFR &sect;1023.220), Rainmaker Securities must verify each client's identity against a government-issued photo ID before any transaction. Your document is encrypted in your browser before it leaves this page and can be opened only by Rainmaker Securities compliance. It is stored with AES-256 encryption in accordance with SEC Regulation S-P (the Safeguards Rule), and it is never sent by email &mdash; not to your referring agent, not to anyone.</span>
-          </div>
-        </div>
 
         <div class="two-col">
           <div class="field" data-field="client_first_name">
@@ -819,6 +831,16 @@ __HEADER__
           </label>
           <div class="field-error"></div>
         </div>
+
+        <div class="field">
+          <label class="field-label">Final Step: Identity Verification</label>
+          <p class="helper-text">Upload a government issued photo ID of the Client. If this cannot be obtained, upload a text narrative that documents the circumstances of the Client's refusal, neglect, or inability to provide the requested document. Note that if we cannot verify a Client's identity in some manner, we cannot legally transact with the Client.</p>
+          <button type="button" class="btn" id="upload-id-btn">Upload ID Document</button>
+          <div class="id-upload-notice" id="id-upload-notice">
+            <span class="id-upload-notice-icon">&#128274;</span>
+            <span><strong>Identity verification is required by federal law.</strong> Under the USA PATRIOT Act and U.S. Treasury regulations (31 CFR &sect;1023.220), Rainmaker Securities must verify each client's identity against a government-issued photo ID before any transaction. Your document is encrypted in your browser before it leaves this page and can be opened only by Rainmaker Securities compliance. It is stored with AES-256 encryption in accordance with SEC Regulation S-P (the Safeguards Rule), and it is never sent by email &mdash; not to your referring agent, not to anyone.</span>
+          </div>
+        </div>
       </div>
 
       <div class="nav-buttons">
@@ -858,6 +880,7 @@ __HEADER__
   var currentStep = 1;
   var totalSteps = 3;
   var agentSelectionKey = null;
+  var draftId = null;
 
   function qs(sel, root) { return (root || document).querySelector(sel); }
   function qsa(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
@@ -1045,10 +1068,31 @@ __HEADER__
     return invalid ? invalid.getAttribute("data-field") : null;
   }
 
+  function saveDraft(step) {
+    // Fire-and-forget partial-submission capture: a failed draft save must
+    // never interrupt the client, so every error path here is swallowed.
+    if (!draftId) {
+      if (!(window.crypto && typeof window.crypto.randomUUID === "function")) { return; }
+      draftId = window.crypto.randomUUID();
+    }
+    try {
+      var payload = collectFormData();
+      payload.action = "draft";
+      payload.draft_id = draftId;
+      payload.last_step = step;
+      fetch("/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      }).catch(function () {});
+    } catch (e) { /* never interrupt the client */ }
+  }
+
   qs("#next-btn").addEventListener("click", function () {
     var ok = currentStep === 1 ? validateStep1() : (currentStep === 2 ? validateStep2() : true);
     if (!ok) { focusAndScroll(firstInvalidField()); return; }
     goToStep(currentStep + 1);
+    saveDraft(currentStep);
   });
 
   qs("#back-btn").addEventListener("click", function () {
@@ -1093,6 +1137,7 @@ __HEADER__
     btn.textContent = "Submitting...";
     var payload = collectFormData();
     payload.action = "submit";
+    if (draftId) { payload.draft_id = draftId; }
     fetch("/", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1501,14 +1546,14 @@ ADMIN_PAGE_RENDERED = ADMIN_PAGE_TEMPLATE.replace("__SHARED_CSS__", SHARED_CSS).
 GLEN_NOTE_TEXTS = {
     1: "Glen: You're viewing the annotated version — these margin notes appear only on this private preview link. Clients see a clean form with none of this.",
     2: "Glen: Two paths, both foolproof: each agent gets a personal link that pre-fills and locks their name — and if a raw link circulates, the client picks the agent from the official roster instead of typing. Either way, every submission arrives correctly attributed. No more blank, misspelled, or unknown agent fields. If the client selects 'No referring agent', the form auto-routes to ops@rainmakersecurities.com — nothing lands unassigned.",
-    3: "Glen: The text at left describes the end state; the upload itself is switched off until RMS confirms where these documents should live. The design is worth the wait: the ID gets encrypted in the client's browser with an RMS-held key, so it lands in storage as ciphertext that only RMS compliance can open — I can't see it, and no other agent can either. My recommendation: we stop emailing ID copies to referring brokers entirely, as happens today. The broker receives the engagement form data; the ID goes to RMS only. Fewer copies of passports sitting in fewer inboxes.",
+    3: "Glen: The text at left describes the end state; the upload itself is switched off until RMS confirms where these documents should live. The design is worth the wait: the ID gets encrypted in the client's browser with an RMS-held key, so it lands in storage as ciphertext that only RMS compliance can open — I can't see it, and no other agent can either. My recommendation: we stop emailing ID copies to referring brokers entirely, as happens today. The broker receives the engagement form data; the ID goes to RMS only. Fewer copies of passports sitting in fewer inboxes. Moving the ID to the very end is deliberate best practice: clients invest ten minutes before facing the highest-friction ask, so completion goes up — and because we now save progress step by step, we capture the client's details and see exactly where people drop out before the ID, instead of losing them entirely.",
     4: "Glen: Country now comes first and drives the rest: US clients get a proper state dropdown, the form pre-populates city and state from the zip code, and zip code errors are disallowed at entry. Bad addresses can no longer reach us.",
     5: "Glen: Every identification field is now required and format-checked before the client can advance — fewer incomplete forms, fewer repeat requests back to the client.",
     6: "Glen: Occupation is now a standardized dropdown with an Other option. Today we get free text — real examples from our files: 'VC', 'Real Estate', 'N/A' — which makes the data inconsistent and hard to use.",
     7: "Glen: It's not possible to have more than one net worth, so I switched these from check-all-that-apply to single-choice dropdowns. Same for annual income. One clean answer per question.",
     8: "Glen: If a client selects NONE OF THE ABOVE for net worth or investments, they see an immediate eligibility warning and the submission is flagged in the admin view — we catch unqualified clients at the door instead of after the paperwork.",
     9: "Glen: Everything on this form is validated the moment it's typed, and the whole thing is re-checked on our server before it's stored — so what lands in the database is complete, consistent, and correctly attributed on the first pass.",
-    10: "Glen: On submit, the client sees a thank-you screen with any text we want. Behind it, a full copy goes to the RMS team and a summary goes to the referring agent automatically — with the ID and anything else we choose stripped out of the agent's copy.",
+    10: "Glen: On submit, the client sees our thank-you screen while two emails go out automatically: the referring broker instantly receives a clean one-page PDF of the engagement form (sensitive identifiers masked, no ID documents), and the RMS team receives the complete PDF plus any identity documents. Nobody types anything into the CRM, and the broker never handles the client's ID.",
 }
 
 # Each entry: (note number, unique anchor substring already present in
@@ -1517,7 +1562,7 @@ GLEN_NOTE_TEXTS = {
 GLEN_NOTE_ANCHORS = [
     (1, '<ol class="instructions-list">', "before"),
     (2, '<div id="referring-agent-section">', "before"),
-    (3, '<div class="field">\n          <label class="field-label">Identity Verification Upload</label>', "before"),
+    (3, '<label class="field-label">Final Step: Identity Verification</label>', "before"),
     (4, '<h3>Address of Client</h3>', "after"),
     (5, '<div class="two-col">\n          <div class="field" data-field="client_phone">', "before"),
     (6, '<div class="field" data-field="occupation">', "before"),
@@ -1906,6 +1951,172 @@ def validate_submission(raw):
     return errors, data
 
 
+def extract_draft_data(raw):
+    """Lenient counterpart to validate_submission(): keeps whatever provided
+    fields pass FORMAT checks, silently drops anything malformed, and never
+    requires a field to be present. Used for action=draft partial saves."""
+    data = {}
+
+    def opt(field, max_len=500):
+        val = raw.get(field)
+        if not is_blank(val):
+            data[field] = str(val).strip()[:max_len]
+
+    def opt_checklist(field, allowed):
+        vals = raw.get(field)
+        if isinstance(vals, list):
+            cleaned = [str(v).strip() for v in vals if str(v).strip() in allowed]
+            if cleaned:
+                data[field] = cleaned
+
+    opt("agent_first_name")
+    opt("agent_last_name")
+    agent_email = str(raw.get("agent_email", "")).strip()
+    if agent_email and EMAIL_RE.match(agent_email):
+        data["agent_email"] = agent_email[:500]
+
+    opt("client_first_name")
+    opt("client_last_name")
+
+    country = str(raw.get("address_country", "")).strip()
+    if country:
+        data["address_country"] = country[:500]
+    opt("address_street")
+    opt("address_street2")
+    opt("address_city")
+
+    state = str(raw.get("address_state", "")).strip()
+    if state:
+        if country == "United States":
+            if state in US_STATES:
+                data["address_state"] = state
+        else:
+            data["address_state"] = state[:500]
+
+    zip_code = str(raw.get("address_zip", "")).strip()
+    if zip_code:
+        if country == "United States":
+            if US_ZIP_RE.match(zip_code):
+                data["address_zip"] = zip_code
+        else:
+            data["address_zip"] = zip_code[:20]
+
+    phone = str(raw.get("client_phone", "")).strip()
+    if phone and len(re.sub(r"\D", "", phone)) >= 7:
+        data["client_phone"] = phone[:500]
+
+    client_email = str(raw.get("client_email", "")).strip()
+    if client_email and EMAIL_RE.match(client_email):
+        data["client_email"] = client_email[:500]
+
+    opt("tax_id")
+
+    dob_raw = raw.get("date_of_birth")
+    if not is_blank(dob_raw):
+        try:
+            dob = datetime.date.fromisoformat(str(dob_raw).strip())
+            today = datetime.date.today()
+            age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+            if dob <= today and 18 <= age <= 110:
+                data["date_of_birth"] = dob.isoformat()
+        except ValueError:
+            pass
+
+    associated_person = str(raw.get("associated_person", "")).strip()
+    if associated_person in ("not_associated", "other"):
+        data["associated_person"] = associated_person
+        if associated_person == "other":
+            crd = str(raw.get("crd_number", "")).strip()
+            if crd and re.match(r"^\d+$", crd):
+                data["crd_number"] = crd
+
+    opt("missing_info_notes", max_len=4000)
+
+    occupation = str(raw.get("occupation", "")).strip()
+    if occupation in OCCUPATION_OPTIONS:
+        data["occupation"] = occupation
+        if occupation == "Other":
+            occupation_other = str(raw.get("occupation_other", "")).strip()
+            if occupation_other:
+                data["occupation_other"] = occupation_other[:200]
+
+    opt("employer_name")
+    employer_name_val = str(raw.get("employer_name", "")).strip()
+    has_employer = bool(employer_name_val) and employer_name_val.upper() != "NONE"
+    if has_employer:
+        employer_country = str(raw.get("employer_country", "")).strip()
+        if employer_country:
+            data["employer_country"] = employer_country[:500]
+        opt("employer_city")
+        employer_state = str(raw.get("employer_state", "")).strip()
+        if employer_state:
+            if employer_country == "United States":
+                if employer_state in US_STATES:
+                    data["employer_state"] = employer_state
+            else:
+                data["employer_state"] = employer_state[:500]
+        if employer_country == "United States":
+            employer_zip = str(raw.get("employer_zip", "")).strip()
+            if employer_zip and US_ZIP_RE.match(employer_zip):
+                data["employer_zip"] = employer_zip
+
+    retiring = raw.get("retiring_five_years")
+    if retiring in YES_NO:
+        data["retiring_five_years"] = retiring
+
+    net_worth = str(raw.get("net_worth", "")).strip()
+    if net_worth in NET_WORTH_OPTIONS:
+        data["net_worth"] = net_worth
+    cumulative = str(raw.get("cumulative_investments", "")).strip()
+    if cumulative in NET_WORTH_OPTIONS:
+        data["cumulative_investments"] = cumulative
+    if data.get("net_worth") == "NONE OF THE ABOVE" or data.get("cumulative_investments") == "NONE OF THE ABOVE":
+        data["eligibility_warning"] = True
+
+    annual_income = str(raw.get("annual_income", "")).strip()
+    if annual_income in ANNUAL_INCOME_OPTIONS:
+        data["annual_income"] = annual_income
+
+    opt_checklist("investment_objectives", INVESTMENT_OBJECTIVE_OPTIONS)
+    if "Other" in data.get("investment_objectives", []):
+        other_obj = str(raw.get("other_objective", "")).strip()
+        if other_obj:
+            data["other_objective"] = other_obj[:500]
+
+    opt_checklist("previous_investment_types", PREVIOUS_INVESTMENT_OPTIONS)
+
+    years_exp = raw.get("years_experience")
+    if not is_blank(years_exp):
+        try:
+            years_exp_int = int(years_exp)
+            if 0 <= years_exp_int <= 80:
+                data["years_experience"] = years_exp_int
+        except (ValueError, TypeError):
+            pass
+
+    opt_checklist("client_sophistication", SOPHISTICATION_OPTIONS)
+    if "Other" in data.get("client_sophistication", []):
+        soph_other = str(raw.get("sophistication_other", "")).strip()
+        if soph_other:
+            data["sophistication_other"] = soph_other[:500]
+
+    for field in (
+        "q_private_equity_five_years",
+        "q_illiquid_investments",
+        "q_risk_tolerance",
+        "q_independent_judgement",
+    ):
+        val = raw.get(field)
+        if val in YES_NO:
+            data[field] = val
+
+    attestation = str(raw.get("attestation", "")).strip()
+    if attestation in ("agent", "client"):
+        data["attestation"] = attestation
+
+    return data
+
+
 # ---------------------------------------------------------------------------
 # Rate limiting
 # ---------------------------------------------------------------------------
@@ -1927,26 +2138,445 @@ def check_rate_limit(ip):
 
 
 # ---------------------------------------------------------------------------
-# Notification email
+# Admin link helper (shared by the submit notification and the sweep)
 # ---------------------------------------------------------------------------
 
-def send_notification_email(agent_email, item, submission_id, host):
-    if not agent_email or not agent_email.lower().endswith(AGENT_EMAIL_DOMAIN):
-        return
+def build_admin_link(submission_id, host=None):
+    admin_key = os.environ.get("ADMIN_KEY", "")
+    resolved_host = host or os.environ.get(FORM_HOST_ENV_VAR, "")
+    if not resolved_host:
+        return ""
+    return f"https://{resolved_host}/?view=admin&key={admin_key}&id={submission_id}"
+
+
+# ---------------------------------------------------------------------------
+# PDF generation (one-page Client Engagement Form summary)
+# ---------------------------------------------------------------------------
+
+PDF_NAVY = (27, 42, 74)
+PDF_GOLD = (185, 151, 91)
+PDF_RED = (192, 57, 43)
+PDF_GREY = (90, 90, 90)
+PDF_PAGE_FORMAT = "Letter"
+PDF_MARGIN_MM = 14
+PDF_FOOTER_RESERVE_MM = 16
+
+
+PDF_CHAR_TRANSLATION = {
+    "—": "-", "–": "-", "‘": "'", "’": "'",
+    "“": '"', "”": '"', "…": "...", "•": "*", " ": " ",
+}
+
+
+def _pdf_text(value):
+    if value is None or value == "":
+        return "-"
+    text = str(value)
+    for src, dest in PDF_CHAR_TRANSLATION.items():
+        text = text.replace(src, dest)
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
+def _pdf_join(values, extra=None):
+    if isinstance(values, list) and values:
+        text = ", ".join(str(v) for v in values)
+    else:
+        text = "-"
+    if extra:
+        text = f"{text} (Other: {extra})" if text != "-" else f"Other: {extra}"
+    return text
+
+
+def _pdf_yes_no(value):
+    return value if value in ("Yes", "No") else "-"
+
+
+def _mask_tax_id(tax_id):
+    tax_id = str(tax_id or "").strip()
+    if not tax_id:
+        return "-"
+    if len(tax_id) <= 4:
+        return tax_id
+    return "*" * (len(tax_id) - 4) + tax_id[-4:]
+
+
+def _cef_pdf_sections(item, mask_tax_id):
+    client_name = f"{item.get('client_first_name', '')} {item.get('client_last_name', '')}".strip() or "-"
+    agent_name = f"{item.get('agent_first_name', '')} {item.get('agent_last_name', '')}".strip() or "-"
+
+    address_line1_parts = [p for p in [item.get("address_street"), item.get("address_street2")] if p]
+    address_line1 = ", ".join(address_line1_parts) if address_line1_parts else "-"
+    city_state_zip = ", ".join(p for p in [item.get("address_city"), item.get("address_state"), item.get("address_zip")] if p) or "-"
+
+    associated_yes = item.get("associated_person") == "other"
+    associated_text = "Yes" if associated_yes else "No"
+    if associated_yes and item.get("crd_number"):
+        associated_text += f" (CRD# {item['crd_number']})"
+
+    occupation = item.get("occupation") or "-"
+    if item.get("occupation") == "Other" and item.get("occupation_other"):
+        occupation = f"Other ({item['occupation_other']})"
+
+    employer_addr = ", ".join(
+        p for p in [item.get("employer_city"), item.get("employer_state"), item.get("employer_zip"), item.get("employer_country")] if p
+    ) or "-"
+
+    attestation = {
+        "agent": "Attested by Agent",
+        "client": "Attested by Client",
+    }.get(item.get("attestation"), "-")
+
+    top_row = [
+        ("Reference & Date", [
+            ("Reference", item.get("submission_id", "-")),
+            ("Date", item.get("created_at", "-")),
+        ]),
+        ("Referring Agent", [
+            ("Name", agent_name),
+            ("Email", item.get("agent_email") or "-"),
+        ]),
+    ]
+
+    stacked = [
+        ("Client", [
+            ("Name", client_name),
+            ("Email", item.get("client_email") or "-"),
+            ("Phone", item.get("client_phone") or "-"),
+            ("DOB", item.get("date_of_birth") or "-"),
+        ]),
+        ("Address", [
+            ("Street", address_line1),
+            ("City / State / Zip", city_state_zip),
+            ("Country", item.get("address_country") or "-"),
+        ]),
+        ("Identification", [
+            ("Tax ID / Gov't ID", _mask_tax_id(item.get("tax_id")) if mask_tax_id else (item.get("tax_id") or "-")),
+            ("Associated Person", associated_text),
+        ]),
+        ("Employment", [
+            ("Occupation", occupation),
+            ("Employer", item.get("employer_name") or "-"),
+            ("Employer Address", employer_addr),
+        ]),
+        ("Financial Profile", [
+            ("Net Worth", item.get("net_worth") or "-"),
+            ("Cumulative Investments", item.get("cumulative_investments") or "-"),
+            ("Annual Income", item.get("annual_income") or "-"),
+            ("Years Experience", item.get("years_experience") if item.get("years_experience") is not None else "-"),
+        ]),
+        ("Investment Profile", [
+            ("Objectives", _pdf_join(item.get("investment_objectives"), item.get("other_objective"))),
+            ("Previous Investment Types", _pdf_join(item.get("previous_investment_types"))),
+            ("Sophistication", _pdf_join(item.get("client_sophistication"), item.get("sophistication_other"))),
+        ]),
+        ("Suitability", [
+            ("Private equity/debt (past 5 yrs)", _pdf_yes_no(item.get("q_private_equity_five_years"))),
+            ("Can invest w/ limited liquidity need", _pdf_yes_no(item.get("q_illiquid_investments"))),
+            ("Risk tolerance for private securities", _pdf_yes_no(item.get("q_risk_tolerance"))),
+            ("Capable of independent judgement", _pdf_yes_no(item.get("q_independent_judgement"))),
+        ]),
+        ("Attestation", [
+            ("Attestation", attestation),
+        ]),
+    ]
+    return top_row, stacked
+
+
+def _draw_pdf_block(pdf, x, y, w, title, rows, font_size):
+    label_w = w * 0.40
+    value_w = w - label_w
+    pdf.set_xy(x, y)
+    pdf.set_font("helvetica", "B", font_size + 1)
+    pdf.set_text_color(*PDF_NAVY)
+    pdf.cell(w, font_size * 0.55, _pdf_text(title.upper()))
+    y += font_size * 0.62
+    pdf.set_draw_color(*PDF_GOLD)
+    pdf.set_line_width(0.2)
+    pdf.line(x, y, x + w, y)
+    y += font_size * 0.18
+    for label, value in rows:
+        pdf.set_xy(x, y)
+        pdf.set_font("helvetica", "B", font_size)
+        pdf.set_text_color(*PDF_GREY)
+        pdf.cell(label_w, font_size * 0.5, _pdf_text(label))
+        pdf.set_xy(x + label_w, y)
+        pdf.set_font("helvetica", "", font_size)
+        pdf.set_text_color(*PDF_NAVY)
+        pdf.multi_cell(value_w, font_size * 0.5, _pdf_text(value))
+        y = pdf.get_y() + font_size * 0.08
+    return y
+
+
+def _render_cef_pdf(item, mask_tax_id, font_size):
+    top_row, stacked = _cef_pdf_sections(item, mask_tax_id)
+
+    pdf = FPDF(format=PDF_PAGE_FORMAT, unit="mm")
+    pdf.set_auto_page_break(False)
+    pdf.set_margins(PDF_MARGIN_MM, PDF_MARGIN_MM, PDF_MARGIN_MM)
+    pdf.add_page()
+    page_w = pdf.w
+    page_h = pdf.h
+    content_w = page_w - 2 * PDF_MARGIN_MM
+
+    pdf.set_fill_color(*PDF_NAVY)
+    pdf.rect(0, 0, page_w, 24, style="F")
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("helvetica", "B", 17)
+    pdf.set_xy(PDF_MARGIN_MM, 6)
+    pdf.cell(content_w, 8, _pdf_text("RAINMAKER SECURITIES"))
+    pdf.set_font("helvetica", "", 10)
+    pdf.set_xy(PDF_MARGIN_MM, 15)
+    pdf.cell(content_w, 6, _pdf_text("Client Engagement Form — Natural Person"))
+
+    pdf.set_fill_color(*PDF_GOLD)
+    pdf.rect(0, 24, page_w, 1.6, style="F")
+
+    y = 30
+    if item.get("eligibility_warning"):
+        pdf.set_xy(PDF_MARGIN_MM, y)
+        pdf.set_font("helvetica", "B", 10)
+        pdf.set_text_color(*PDF_RED)
+        pdf.cell(content_w, 6, _pdf_text("WARNING: May not be eligible for private secondary transactions."))
+        y += 7
+
+    col_w = (content_w - 6) / 2
+    y_left = _draw_pdf_block(pdf, PDF_MARGIN_MM, y, col_w, top_row[0][0], top_row[0][1], font_size)
+    y_right = _draw_pdf_block(pdf, PDF_MARGIN_MM + col_w + 6, y, col_w, top_row[1][0], top_row[1][1], font_size)
+    y = max(y_left, y_right) + 2
+
+    for title, rows in stacked:
+        y = _draw_pdf_block(pdf, PDF_MARGIN_MM, y, content_w, title, rows, font_size) + 2
+
+    fits = y <= (page_h - PDF_FOOTER_RESERVE_MM)
+
+    footer_y = page_h - PDF_FOOTER_RESERVE_MM + 4
+    pdf.set_draw_color(*PDF_GOLD)
+    pdf.set_line_width(0.4)
+    pdf.line(PDF_MARGIN_MM, footer_y, page_w - PDF_MARGIN_MM, footer_y)
+    pdf.set_xy(PDF_MARGIN_MM, footer_y + 2)
+    pdf.set_font("helvetica", "", 7.5)
+    pdf.set_text_color(*PDF_NAVY)
+    pdf.cell(content_w, 5, _pdf_text("Rainmaker Securities, LLC — Member FINRA/SIPC — Confidential"))
+
+    return pdf, fits
+
+
+def build_cef_pdf(item, mask_tax_id=False):
+    pdf = None
+    for font_size in (9, 8.5, 8, 7.5, 7):
+        pdf, fits = _render_cef_pdf(item, mask_tax_id, font_size)
+        if fits:
+            break
+    return bytes(pdf.output())
+
+
+# ---------------------------------------------------------------------------
+# Submission emails (Part C): broker copy (masked) + RMS copy (full + ID)
+# ---------------------------------------------------------------------------
+
+def _fetch_id_document(s3_key):
     try:
-        admin_key = os.environ.get("ADMIN_KEY", "")
-        admin_link = f"https://{host}/?view=admin&key={admin_key}&id={submission_id}"
-        subject = f"New Client Engagement Form: {item.get('client_first_name', '')} {item.get('client_last_name', '')}"
+        resp = s3.get_object(Bucket=BUCKET_NAME, Key=s3_key)
+        return resp["Body"].read()
+    except ClientError:
+        return None
+
+
+def send_submission_emails(item, submission_id, host):
+    client_first = item.get("client_first_name", "")
+    client_last = item.get("client_last_name", "")
+    client_ref = client_last or client_first or "Client"
+    agent_email = str(item.get("agent_email", "")).strip()
+    admin_link = build_admin_link(submission_id, host)
+
+    # 1) Broker copy: only to a whitelisted RMS-domain agent, Tax ID masked,
+    #    no ID documents.
+    if agent_email and agent_email.lower().endswith(AGENT_EMAIL_DOMAIN):
+        try:
+            broker_pdf = build_cef_pdf(item, mask_tax_id=True)
+            msg = MIMEMultipart()
+            msg["Subject"] = f"New Client Engagement Form: {client_first} {client_last}".strip()
+            msg["From"] = SES_SENDER
+            msg["To"] = agent_email
+            msg["Reply-To"] = SES_REPLY_TO
+            body_text = (
+                "A new Client Engagement Form has been submitted.\n\n"
+                f"Client: {client_first} {client_last}\n"
+                "A one-page summary is attached as a PDF. Sensitive identifiers are masked.\n\n"
+                "View full submission:\n"
+                f"{admin_link if admin_link else '(admin link unavailable)'}\n"
+            )
+            msg.attach(MIMEText(body_text, "plain"))
+            attachment = MIMEApplication(broker_pdf, _subtype="pdf")
+            attachment.add_header(
+                "Content-Disposition", "attachment", filename=f"CEF-{client_ref}-{submission_id[:8]}.pdf"
+            )
+            msg.attach(attachment)
+            ses.send_raw_email(RawMessage={"Data": msg.as_bytes()})
+            print(f"route=submit status=broker_email_sent submission_id={submission_id}")
+        except Exception:
+            print(f"route=submit status=broker_email_failed submission_id={submission_id}")
+
+    # 2) RMS copy: always to RMS_TEAM_EMAIL, full (unmasked) PDF, plus any ID
+    #    document already uploaded to S3.
+    try:
+        rms_pdf = build_cef_pdf(item, mask_tax_id=False)
+        msg = MIMEMultipart()
+        msg["Subject"] = f"[RMS Copy] New Client Engagement Form: {client_first} {client_last}".strip()
+        msg["From"] = SES_SENDER
+        msg["To"] = RMS_TEAM_EMAIL
+        msg["Reply-To"] = SES_REPLY_TO
         body_text = (
             "A new Client Engagement Form has been submitted.\n\n"
-            f"Client Name: {item.get('client_first_name', '')} {item.get('client_last_name', '')}\n"
-            f"Client Email: {item.get('client_email', '')}\n"
-            f"Client Phone: {item.get('client_phone', '')}\n"
+            f"Client: {client_first} {client_last}\n"
             f"Referring Agent: {item.get('agent_first_name', '')} {item.get('agent_last_name', '')}\n"
-            f"Submitted (UTC): {item.get('created_at', '')}\n\n"
+            "The complete one-page PDF is attached, plus any identity document on file.\n\n"
             "View full submission:\n"
-            f"{admin_link}\n"
+            f"{admin_link if admin_link else '(admin link unavailable)'}\n"
         )
+        msg.attach(MIMEText(body_text, "plain"))
+        attachment = MIMEApplication(rms_pdf, _subtype="pdf")
+        attachment.add_header(
+            "Content-Disposition", "attachment", filename=f"CEF-{client_ref}-{submission_id[:8]}.pdf"
+        )
+        msg.attach(attachment)
+
+        s3_key = item.get("id_upload_s3_key")
+        if s3_key:
+            id_bytes = _fetch_id_document(s3_key)
+            if id_bytes:
+                ext = str(s3_key).rsplit(".", 1)[-1].lower()
+                id_attachment = MIMEApplication(id_bytes, _subtype=ext or "octet-stream")
+                id_attachment.add_header(
+                    "Content-Disposition", "attachment", filename=f"ID-{client_ref}-{submission_id[:8]}.{ext}"
+                )
+                msg.attach(id_attachment)
+
+        ses.send_raw_email(RawMessage={"Data": msg.as_bytes()})
+        print(f"route=submit status=rms_email_sent submission_id={submission_id}")
+    except Exception:
+        print(f"route=submit status=rms_email_failed submission_id={submission_id}")
+
+
+# ---------------------------------------------------------------------------
+# Draft (partial submission capture)
+# ---------------------------------------------------------------------------
+
+def handle_draft(body, ip):
+    if str(body.get("website", "")).strip():
+        print("route=draft status=honeypot")
+        return response_json({"ok": True})
+
+    try:
+        body_size = len(json.dumps(body).encode("utf-8"))
+    except (TypeError, ValueError):
+        body_size = 0
+    if body_size > DRAFT_MAX_BYTES:
+        print("route=draft status=413")
+        return response_json({"ok": False, "error": "draft_too_large"}, 413)
+
+    if not check_rate_limit(ip):
+        print("route=draft status=429")
+        return response_json(
+            {
+                "ok": False,
+                "error": "rate_limited",
+                "message": "Submission limit reached for this hour. Please wait a few minutes and try again.",
+            },
+            429,
+        )
+
+    if not body.get("confirm_read"):
+        print("route=draft status=400")
+        return response_json({"ok": False, "error": "confirm_read_required"}, 400)
+
+    draft_id = str(body.get("draft_id", "")).strip()
+    if not draft_id:
+        print("route=draft status=400")
+        return response_json({"ok": False, "error": "missing_draft_id"}, 400)
+
+    try:
+        last_step = int(body.get("last_step"))
+    except (TypeError, ValueError):
+        last_step = 1
+    last_step = max(1, min(3, last_step))
+
+    data = extract_draft_data(body)
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+
+    try:
+        existing = table.get_item(Key={"submission_id": draft_id}).get("Item")
+    except ClientError:
+        existing = None
+    created_at = (existing or {}).get("created_at") or now
+
+    item = {
+        "submission_id": draft_id,
+        "form_type": FORM_TYPE_CEF_NATURAL,
+        "status": DRAFT_STATUS_PARTIAL,
+        "last_step": last_step,
+        "created_at": created_at,
+        "updated_at": now,
+        "ip": ip,
+    }
+    item.update(data)
+
+    try:
+        table.put_item(Item=item)
+    except ClientError:
+        print(f"route=draft status=500 draft_id={draft_id}")
+        return response_json({"ok": False, "error": "storage_failed"}, 500)
+
+    print(f"route=draft status=200 draft_id={draft_id} last_step={last_step}")
+    return response_json({"ok": True, "draft_id": draft_id})
+
+
+# ---------------------------------------------------------------------------
+# Sweep (EventBridge Scheduler invocation: notify + delete stale partials)
+# ---------------------------------------------------------------------------
+
+def _parse_iso_datetime(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def send_partial_notification_email(item):
+    agent_email = str(item.get("agent_email", "")).strip()
+    if not agent_email or not agent_email.lower().endswith(AGENT_EMAIL_DOMAIN):
+        return
+    client_name = f"{item.get('client_first_name', '')} {item.get('client_last_name', '')}".strip() or "Unknown client"
+    submission_id = item.get("submission_id", "")
+    try:
+        admin_link = build_admin_link(submission_id)
+        subject = f"Form partially completed: {client_name}"
+        lines = [
+            "A Client Engagement Form was started but not completed.",
+            "",
+            f"Client Name: {client_name}",
+        ]
+        if item.get("client_email"):
+            lines.append(f"Client Email: {item['client_email']}")
+        if item.get("client_phone"):
+            lines.append(f"Client Phone: {item['client_phone']}")
+        lines.append(f"Step Reached: {item.get('last_step', '?')} of 3")
+        lines.append(f"Last Active (UTC): {item.get('updated_at', '')}")
+        lines.append("")
+        if admin_link:
+            lines.append("View full submission:")
+            lines.append(admin_link)
+        else:
+            lines.append(
+                f"Admin link unavailable: set the {FORM_HOST_ENV_VAR} environment variable "
+                "on the rms-forms Lambda to enable links in these emails."
+            )
+        body_text = "\n".join(lines) + "\n"
         ses.send_email(
             Source=SES_SENDER,
             Destination={"ToAddresses": [agent_email]},
@@ -1954,7 +2584,65 @@ def send_notification_email(agent_email, item, submission_id, host):
             ReplyToAddresses=[SES_REPLY_TO],
         )
     except Exception:
-        print(f"route=submit status=email_failed submission_id={submission_id}")
+        print(f"route=sweep status=email_failed submission_id={submission_id}")
+
+
+def handle_sweep():
+    now = datetime.datetime.utcnow()
+    notified = 0
+    deleted = 0
+    errors = 0
+
+    try:
+        items = []
+        resp = table.scan(FilterExpression=Attr("status").eq(DRAFT_STATUS_PARTIAL))
+        items.extend(resp.get("Items", []))
+        while "LastEvaluatedKey" in resp:
+            resp = table.scan(
+                FilterExpression=Attr("status").eq(DRAFT_STATUS_PARTIAL),
+                ExclusiveStartKey=resp["LastEvaluatedKey"],
+            )
+            items.extend(resp.get("Items", []))
+    except ClientError:
+        items = []
+
+    for item in items:
+        submission_id = item.get("submission_id", "")
+        try:
+            created_dt = _parse_iso_datetime(item.get("created_at"))
+            updated_dt = _parse_iso_datetime(item.get("updated_at"))
+
+            if created_dt and (now - created_dt) > DRAFT_DELETE_AFTER:
+                try:
+                    table.delete_item(Key={"submission_id": submission_id})
+                    deleted += 1
+                except ClientError:
+                    errors += 1
+                continue
+
+            if item.get("notified"):
+                continue
+            if not updated_dt or (now - updated_dt) < DRAFT_NOTIFY_AFTER:
+                continue
+            if not created_dt or (now - created_dt) > DRAFT_NOTIFY_WITHIN:
+                continue
+
+            send_partial_notification_email(item)
+            try:
+                table.update_item(
+                    Key={"submission_id": submission_id},
+                    UpdateExpression="SET notified = :t",
+                    ExpressionAttributeValues={":t": True},
+                )
+            except ClientError:
+                pass
+            notified += 1
+        except Exception:
+            errors += 1
+            continue
+
+    print(f"route=sweep status=200 notified={notified} deleted={deleted} errors={errors}")
+    return {"ok": True, "notified": notified, "deleted": deleted, "errors": errors}
 
 
 # ---------------------------------------------------------------------------
@@ -1982,12 +2670,29 @@ def handle_submit(body, ip, host):
         print("route=submit status=400")
         return response_json({"ok": False, "errors": errors}, 400)
 
-    submission_id = str(uuid.uuid4())
-    created_at = datetime.datetime.utcnow().isoformat() + "Z"
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+    draft_id = str(body.get("draft_id", "")).strip()
+    created_at = None
+    if draft_id:
+        try:
+            existing = table.get_item(Key={"submission_id": draft_id}).get("Item")
+        except ClientError:
+            existing = None
+        if existing:
+            created_at = existing.get("created_at")
+        submission_id = draft_id
+    else:
+        submission_id = str(uuid.uuid4())
+
+    if not created_at:
+        created_at = now
+
     item = {
         "submission_id": submission_id,
         "form_type": FORM_TYPE_CEF_NATURAL,
+        "status": SUBMISSION_STATUS_COMPLETE,
         "created_at": created_at,
+        "updated_at": now,
         "ip": ip,
     }
     item.update(data)
@@ -2005,7 +2710,7 @@ def handle_submit(body, ip, host):
             500,
         )
 
-    send_notification_email(data.get("agent_email", ""), item, submission_id, host)
+    send_submission_emails(item, submission_id, host)
 
     print(f"route=submit status=200 submission_id={submission_id}")
     return response_json({"ok": True, "submission_id": submission_id})
@@ -2049,6 +2754,9 @@ def render_admin_list(admin_key):
         name_html = html.escape(name)
         if it.get("eligibility_warning"):
             name_html += " <span class='not-eligible-tag'>&#9888; NOT ELIGIBLE</span>"
+        if it.get("status") == DRAFT_STATUS_PARTIAL:
+            step = html.escape(str(it.get("last_step", "?")))
+            name_html += f" <span class='partial-tag'>PARTIAL &mdash; reached step {step}</span>"
         email = str(it.get("client_email", ""))
         agent = str(it.get("agent_email", ""))
         detail_url = f"/?view=admin&key={quote(admin_key)}&id={quote(sid)}"
@@ -2159,6 +2867,10 @@ def handle_admin(params, host):
 
 def lambda_handler(event, context):
     try:
+        # Non-HTTP invocation from EventBridge Scheduler: {"action": "sweep"}
+        if isinstance(event, dict) and event.get("action") == "sweep" and "requestContext" not in event:
+            return handle_sweep()
+
         method = event.get("requestContext", {}).get("http", {}).get("method", "GET")
         raw_qs = event.get("rawQueryString", "")
         params = {k: v[0] for k, v in parse_qs(raw_qs).items()}
@@ -2181,6 +2893,8 @@ def lambda_handler(event, context):
                 return handle_presign(body)
             if action == "submit":
                 return handle_submit(body, ip, host)
+            if action == "draft":
+                return handle_draft(body, ip)
             print("route=unknown_action status=400")
             return response_json({"ok": False, "error": "unknown_action"}, 400)
 
