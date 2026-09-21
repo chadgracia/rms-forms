@@ -22,11 +22,15 @@ item is caught here rather than only in production.
 Run: python3 test_submit_regression.py
 """
 
+import base64
+import email
+import io
 import json
 import re
 
 import lambda_function as lf
 from boto3.dynamodb.types import TypeSerializer
+from botocore.exceptions import ClientError
 
 
 class FakeTable:
@@ -48,17 +52,49 @@ class FakeTable:
                 )
         self.items[Item["submission_id"]] = Item
 
-    def update_item(self, Key, UpdateExpression, ExpressionAttributeValues, ReturnValues=None):
+    def update_item(self, Key, UpdateExpression=None, ExpressionAttributeValues=None,
+                     ExpressionAttributeNames=None, ReturnValues=None):
         sid = Key["submission_id"]
-        current = self.items.get(sid, {}).get("submission_count", 0)
-        current += ExpressionAttributeValues[":incr"]
-        self.items.setdefault(sid, {"submission_id": sid})["submission_count"] = current
-        return {"Attributes": {"submission_count": current}}
+        item = self.items.setdefault(sid, {"submission_id": sid})
+        if UpdateExpression and UpdateExpression.startswith("ADD"):
+            current = item.get("submission_count", 0)
+            current += ExpressionAttributeValues[":incr"]
+            item["submission_count"] = current
+            return {"Attributes": {"submission_count": current}}
+        # SET #a = :a, #b = :b, ... (the pdf-key-recording path)
+        for name_placeholder, attr_name in (ExpressionAttributeNames or {}).items():
+            value_placeholder = ":" + name_placeholder[1:]
+            item[attr_name] = ExpressionAttributeValues[value_placeholder]
+        return {"Attributes": {}}
 
 
 class FakeSES:
-    def send_raw_email(self, **kwargs):
+    def __init__(self):
+        self.sent = []
+
+    def send_raw_email(self, RawMessage, **kwargs):
+        self.sent.append(RawMessage["Data"])
         return {"MessageId": "fake-message-id"}
+
+
+class FakeS3:
+    def __init__(self):
+        self.objects = {}  # key -> (bytes, content_type)
+
+    def put_object(self, Bucket, Key, Body, ContentType=None, **kwargs):
+        self.objects[Key] = (bytes(Body), ContentType)
+
+    def get_object(self, Bucket, Key):
+        if Key not in self.objects:
+            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "not found"}}, "GetObject")
+        body, _ct = self.objects[Key]
+        return {"Body": io.BytesIO(body)}
+
+    def generate_presigned_url(self, op, Params, ExpiresIn=900):
+        return f"https://s3.example.com/{Params['Key']}?presigned=1"
+
+
+MIN_VALID_PDF = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF"
 
 
 AGENT_FIELDS = {"agent_first_name", "agent_last_name", "agent_email"}
@@ -160,10 +196,13 @@ def agent_search_selection(display_name):
     }
 
 
-def run_submit(label, agent_fields):
+def run_submit(label, agent_fields, extra_payload=None):
     lf.table = FakeTable()
     lf.ses = FakeSES()
+    lf.s3 = FakeS3()
     payload = build_payload(agent_fields)
+    if extra_payload:
+        payload.update(extra_payload)
 
     errors, data = lf.validate_submission(payload)
     assert not errors, f"[{label}] validate_submission unexpectedly failed: {errors}"
@@ -173,6 +212,9 @@ def run_submit(label, agent_fields):
     body = json.loads(resp["body"])
     assert body["ok"] is True, f"[{label}] response not ok: {body}"
     assert body["submission_id"], f"[{label}] missing submission_id in response"
+    assert "pdf_b64" not in body and "pdf_filename" not in body, (
+        f"[{label}] response should no longer carry server-generated pdf_b64/pdf_filename"
+    )
     stored = lf.table.items[body["submission_id"]]
     assert stored["agent_first_name"] == agent_fields["agent_first_name"]
     assert stored["agent_last_name"] == agent_fields["agent_last_name"]
@@ -217,6 +259,103 @@ def test_every_roster_agent_via_search():
         run_submit(f"roster: {display_name}", agent_search_selection(display_name))
 
 
+AGENT_FOR_PDF_TESTS = {
+    "agent_first_name": "Ben", "agent_last_name": "Martin",
+    "agent_email": "bmartin@rainmakersecurities.com",
+}
+
+
+def default_pdf_test_run(extra_payload):
+    lf.table = FakeTable()
+    lf.ses = FakeSES()
+    lf.s3 = FakeS3()
+    payload = build_payload(AGENT_FOR_PDF_TESTS)
+    payload.update(extra_payload)
+    resp = lf.handle_submit(payload, "1.2.3.4", "forms.example.com")
+    assert resp["statusCode"] == 200, resp["body"]
+    body = json.loads(resp["body"])
+    return body["submission_id"], lf.table.items[body["submission_id"]]
+
+
+def test_pdf_valid_both_variants_stored_and_attached():
+    sid, stored = default_pdf_test_run({
+        "pdf_broker_b64": base64.b64encode(MIN_VALID_PDF).decode("ascii"),
+        "pdf_rms_b64": base64.b64encode(MIN_VALID_PDF).decode("ascii"),
+    })
+    assert stored.get("pdf_broker_s3_key") == f"pdfs/{sid}-broker.pdf", stored
+    assert stored.get("pdf_rms_s3_key") == f"pdfs/{sid}-rms.pdf", stored
+    broker_bytes, broker_ct = lf.s3.objects[f"pdfs/{sid}-broker.pdf"]
+    rms_bytes, rms_ct = lf.s3.objects[f"pdfs/{sid}-rms.pdf"]
+    assert broker_bytes == MIN_VALID_PDF and broker_ct == "application/pdf"
+    assert rms_bytes == MIN_VALID_PDF and rms_ct == "application/pdf"
+    # DynamoDB never stores the raw PDF bytes, only the S3 key.
+    for v in stored.values():
+        assert v != MIN_VALID_PDF and (not isinstance(v, (bytes, bytearray)))
+    # Broker email (whitelisted @rainmakersecurities.com agent) attaches a PDF;
+    # RMS email attaches a PDF too.
+    assert len(lf.ses.sent) == 2, f"expected broker+RMS emails, got {len(lf.ses.sent)}"
+    for raw in lf.ses.sent:
+        msg = email.message_from_bytes(raw)
+        pdf_parts = [p for p in msg.walk() if p.get_content_type() == "application/pdf"]
+        assert len(pdf_parts) == 1, f"expected exactly one PDF attachment, found {len(pdf_parts)}"
+        assert pdf_parts[0].get_payload(decode=True) == MIN_VALID_PDF
+    print("valid PDFs (both variants): stored in S3, keyed on the item, attached to both emails: OK")
+
+
+def test_pdf_missing_fields_still_succeeds():
+    sid, stored = default_pdf_test_run({})
+    assert "pdf_broker_s3_key" not in stored and "pdf_rms_s3_key" not in stored
+    assert lf.s3.objects == {}, "no PDF fields sent -> no S3 writes at all"
+    assert len(lf.ses.sent) == 2
+    for raw in lf.ses.sent:
+        msg = email.message_from_bytes(raw)
+        pdf_parts = [p for p in msg.walk() if p.get_content_type() == "application/pdf"]
+        assert not pdf_parts, "no PDF was sent, so no attachment should appear"
+    print("missing pdf fields: submission succeeds, no S3 writes, emails sent without attachment: OK")
+
+
+def test_pdf_oversized_ignored():
+    oversized = b"%PDF-1.4\n" + (b"0" * (lf.PDF_MAX_BYTES + 1))
+    sid, stored = default_pdf_test_run({
+        "pdf_broker_b64": base64.b64encode(oversized).decode("ascii"),
+    })
+    assert "pdf_broker_s3_key" not in stored, "an oversized PDF must be silently ignored, not stored"
+    assert lf.s3.objects == {}
+    print(f"oversized PDF ({len(oversized)} bytes > {lf.PDF_MAX_BYTES}): ignored, submission still succeeds: OK")
+
+
+def test_pdf_non_pdf_bytes_ignored():
+    not_a_pdf = b"this is not a PDF at all, just some bytes"
+    sid, stored = default_pdf_test_run({
+        "pdf_rms_b64": base64.b64encode(not_a_pdf).decode("ascii"),
+    })
+    assert "pdf_rms_s3_key" not in stored, "bytes without the %PDF- magic header must be ignored"
+    assert lf.s3.objects == {}
+    print("non-PDF bytes (missing %PDF- magic header): ignored, submission still succeeds: OK")
+
+
+def test_pdf_garbage_base64_ignored():
+    sid, stored = default_pdf_test_run({
+        "pdf_broker_b64": "!!!not-base64-at-all???",
+        "pdf_rms_b64": 12345,  # wrong type entirely
+    })
+    assert "pdf_broker_s3_key" not in stored and "pdf_rms_s3_key" not in stored
+    assert lf.s3.objects == {}
+    print("garbage/non-string pdf_*_b64 values: ignored, submission still succeeds: OK")
+
+
+def test_decode_valid_pdf_unit():
+    assert lf.decode_valid_pdf(None) is None
+    assert lf.decode_valid_pdf("") is None
+    assert lf.decode_valid_pdf(123) is None
+    assert lf.decode_valid_pdf(base64.b64encode(b"not a pdf").decode()) is None
+    too_big = base64.b64encode(b"%PDF-" + b"x" * (lf.PDF_MAX_BYTES + 10)).decode()
+    assert lf.decode_valid_pdf(too_big) is None
+    good = base64.b64encode(MIN_VALID_PDF).decode()
+    assert lf.decode_valid_pdf(good) == MIN_VALID_PDF
+    print("decode_valid_pdf() unit checks: OK")
+
+
 if __name__ == "__main__":
     test_field_coverage_matches_live_page()
     test_path_a_magic_link()
@@ -224,4 +363,10 @@ if __name__ == "__main__":
     test_path_c_no_referring_agent()
     test_path_d_manual_entry()
     test_every_roster_agent_via_search()
+    test_decode_valid_pdf_unit()
+    test_pdf_valid_both_variants_stored_and_attached()
+    test_pdf_missing_fields_still_succeeds()
+    test_pdf_oversized_ignored()
+    test_pdf_non_pdf_bytes_ignored()
+    test_pdf_garbage_base64_ignored()
     print("\nALL SUBMIT REGRESSION TESTS PASSED")
