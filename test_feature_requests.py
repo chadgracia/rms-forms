@@ -15,6 +15,11 @@ os.environ.setdefault("ADMIN_KEY", "test-admin-key")
 
 import lambda_function as lf
 
+# This file's create test verifies the feature-request notification email,
+# so force the kill switch on regardless of the EMAILS_ENABLED env var the
+# test process happens to run under.
+lf.EMAILS_ENABLED = True
+
 
 class FakeTable:
     def __init__(self):

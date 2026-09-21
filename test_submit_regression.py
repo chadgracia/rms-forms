@@ -32,6 +32,11 @@ import lambda_function as lf
 from boto3.dynamodb.types import TypeSerializer
 from botocore.exceptions import ClientError
 
+# This file's whole point is verifying submission emails (PDF attachments,
+# broker/RMS routing), so force the kill switch on regardless of the
+# EMAILS_ENABLED env var the test process happens to run under.
+lf.EMAILS_ENABLED = True
+
 
 class FakeTable:
     def __init__(self):
