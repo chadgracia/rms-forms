@@ -26,6 +26,8 @@ RMS_TEAM_EMAIL = "ops@rainmakersecurities.com"
 # e.g. "xxxxxxxx.lambda-url.us-east-1.on.aws". Falls back gracefully if unset.
 FORM_HOST_ENV_VAR = "FORM_HOST"
 FORM_TYPE_CEF_NATURAL = "cef-natural"
+FORM_TYPE_FEATURE_REQUEST = "feature-request"
+FEATURE_REQUEST_MAX_LEN = 2000
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 PDF_MAX_BYTES = 500 * 1024
 RATE_LIMIT_PER_HOUR = 20
@@ -397,6 +399,15 @@ details.patriot-section p { margin: 12px 0; }
   border: 1px solid #c0392b; background: #fdecea; color: #c0392b; font-weight: 700;
   padding: 10px 14px; border-radius: 4px; margin-top: 8px; font-size: 13px;
 }
+.zip-autofill-notice {
+  border: 1px solid var(--gold); background: #faf6ee; color: var(--navy); font-weight: 600;
+  padding: 8px 12px; border-radius: 4px; margin-top: 8px; font-size: 12.5px;
+}
+@keyframes zipAutofillFlash {
+  0% { background-color: #f2dfb8; }
+  100% { background-color: transparent; }
+}
+.zip-flash { animation: zipAutofillFlash 1.5s ease-out; }
 .not-eligible-tag { color: #c0392b; font-weight: 700; font-size: 11px; margin-left: 6px; white-space: nowrap; }
 .partial-tag {
   color: #8a5a00; background: #fdf3e0; border: 1px solid #c77d00; font-weight: 700;
@@ -665,6 +676,7 @@ __HEADER__
           <label class="field-label" for="address_zip">Postal/Zip Code</label>
           <input type="text" id="address_zip" name="address_zip">
           <div class="helper-text" id="zip-helper" style="display:none;">Format: 12345 or 12345-6789</div>
+          <div class="zip-autofill-notice" id="address-zip-notice" style="display:none;"></div>
           <div class="zip-mismatch" id="address-zip-mismatch" style="display:none;"></div>
           <div class="field-error"></div>
         </div>
@@ -757,6 +769,7 @@ __HEADER__
             <label class="field-label" for="employer_zip">Postal/Zip Code</label>
             <input type="text" id="employer_zip" name="employer_zip">
             <div class="helper-text" id="employer-zip-helper" style="display:none;">Format: 12345 or 12345-6789</div>
+            <div class="zip-autofill-notice" id="employer-zip-notice" style="display:none;"></div>
             <div class="zip-mismatch" id="employer-zip-mismatch" style="display:none;"></div>
             <div class="field-error"></div>
           </div>
@@ -1749,14 +1762,47 @@ __HEADER__
   // refetch. A failed/timed-out/never-attempted lookup simply means no
   // cached entry -- the check silently stays out of the way; it is a
   // convenience layered on the API, never a hard dependency on it.
-  function applyAutofillFromLookup(cfg, lookup) {
-    if (lookup.cities[0] && cfg.cityId) {
-      var cityEl = qs("#" + cfg.cityId);
-      if (cityEl) { cityEl.value = lookup.cities[0]; clearFieldError(cfg.cityId); }
+  function flashField(el) {
+    if (!el) return;
+    el.classList.remove("zip-flash");
+    void el.offsetWidth; // force reflow so a re-triggered flash restarts the animation
+    el.classList.add("zip-flash");
+  }
+
+  function hideZipNotice(cfg) {
+    if (!cfg.noticeBoxId) return;
+    var notice = qs("#" + cfg.noticeBoxId);
+    if (notice) { notice.style.display = "none"; notice.textContent = ""; }
+  }
+
+  function applyAutofillFromLookup(cfg, lookup, zip) {
+    var cityEl = cfg.cityId ? qs("#" + cfg.cityId) : null;
+    var stateEl = qs("#" + cfg.stateId);
+    var oldCity = cityEl ? cityEl.value.trim() : "";
+    var newCity = lookup.cities[0] || "";
+    var newState = lookup.state || "";
+    var cityChanged = !!(newCity && oldCity && oldCity.toLowerCase() !== newCity.toLowerCase());
+
+    if (newCity && cityEl) {
+      cityEl.value = newCity;
+      clearFieldError(cfg.cityId);
+      flashField(cityEl);
     }
-    if (lookup.state) {
-      var stateEl = qs("#" + cfg.stateId);
-      if (stateEl) { stateEl.value = lookup.state; clearFieldError(cfg.stateId); }
+    if (newState && stateEl) {
+      stateEl.value = newState;
+      clearFieldError(cfg.stateId);
+      flashField(stateEl);
+    }
+
+    if (cfg.noticeBoxId && (newCity || newState)) {
+      var notice = qs("#" + cfg.noticeBoxId);
+      if (notice) {
+        var message = cityChanged
+          ? "ZIP " + zip + ": city updated from '" + oldCity + "' to '" + newCity + "', state set to " + newState + "."
+          : "ZIP " + zip + ": city and state set to " + newCity + ", " + newState + ".";
+        notice.textContent = message;
+        notice.style.display = "block";
+      }
     }
   }
 
@@ -1806,7 +1852,7 @@ __HEADER__
           state: places[0]["state"] || ""
         };
         zipLookupCache[zip] = lookup;
-        applyAutofillFromLookup(cfg, lookup);
+        applyAutofillFromLookup(cfg, lookup, zip);
         checkZipMismatch(cfg);
       })
       .catch(function () { clearTimeout(timeoutId); });
@@ -1862,6 +1908,7 @@ __HEADER__
       updateZipVisibility();
       clearFieldError(cfg.stateId);
       if (cfg.zipId) { clearFieldError(cfg.zipId); }
+      if (!isUSCountry(qs("#" + cfg.countryId).value)) { hideZipNotice(cfg); }
       checkZipMismatch(cfg);
     });
 
@@ -1873,12 +1920,16 @@ __HEADER__
     if (cfg.zipId) {
       var zipDebounce = null;
       qs("#" + cfg.zipId).addEventListener("input", function () {
+        // Any edit to the zip itself retires whatever autofill notice was
+        // showing for the previous value -- it persists only "until the
+        // next zip change".
+        hideZipNotice(cfg);
         if (!isUSCountry(qs("#" + cfg.countryId).value)) { checkZipMismatch(cfg); return; }
         var val = qs("#" + cfg.zipId).value.trim();
         if (!/^\d{5}$/.test(val)) { checkZipMismatch(cfg); return; }
         var cached = zipLookupCache[val];
         if (cached) {
-          applyAutofillFromLookup(cfg, cached);
+          applyAutofillFromLookup(cfg, cached, val);
           checkZipMismatch(cfg);
           return;
         }
@@ -1895,12 +1946,13 @@ __HEADER__
   var addressCfg = {
     countryId: "address_country", stateId: "address_state", zipId: "address_zip",
     zipHelperId: "zip-helper", cityId: "address_city", hideZipWhenNonUS: false,
-    mismatchBoxId: "address-zip-mismatch", stateKey: "address"
+    mismatchBoxId: "address-zip-mismatch", noticeBoxId: "address-zip-notice", stateKey: "address"
   };
   var employerCfg = {
     countryId: "employer_country", stateId: "employer_state", zipId: "employer_zip",
     zipWrapId: "employer_zip_wrap", zipHelperId: "employer-zip-helper", cityId: "employer_city",
-    hideZipWhenNonUS: true, mismatchBoxId: "employer-zip-mismatch", stateKey: "employer"
+    hideZipWhenNonUS: true, mismatchBoxId: "employer-zip-mismatch", noticeBoxId: "employer-zip-notice",
+    stateKey: "employer"
   };
   setupAddressBlock(addressCfg);
   setupAddressBlock(employerCfg);
@@ -1922,6 +1974,7 @@ __HEADER__
       qs("#employer_zip").value = "";
       clearFieldError("employer_state");
       clearFieldError("employer_zip");
+      hideZipNotice(employerCfg);
       checkZipMismatch(employerCfg);
     }
   }
@@ -2066,6 +2119,215 @@ def build_glen_note_html(note_number):
     )
 
 
+# ---------------------------------------------------------------------------
+# Feature-request panel: rendered only on the ?notes=glen view (bottom of
+# every step -- one persistent panel, not duplicated per step) and the
+# admin submissions list (top). Never present on the clean client page.
+# ---------------------------------------------------------------------------
+
+FEATURE_REQUEST_PANEL_CSS = """
+.fr-panel {
+  border: 1px solid var(--gold); border-radius: 6px; background: #fffdf8;
+  padding: 16px 18px; margin: 28px 0; max-width: 760px;
+}
+.fr-panel-title {
+  font-family: Georgia, 'Times New Roman', serif; font-weight: 700; color: var(--navy);
+  font-size: 15px; margin-bottom: 10px;
+}
+.fr-input {
+  width: 100%; box-sizing: border-box; padding: 9px 12px; border: 1px solid #d8cfba;
+  border-radius: 4px; font-size: 14px; font-family: inherit; color: var(--navy);
+}
+.fr-input:focus { outline: none; border-color: var(--gold); }
+.fr-status { color: #c0392b; font-size: 12px; margin-top: 6px; min-height: 14px; }
+.fr-open-list, .fr-done-list { list-style: none; margin: 10px 0 0; padding: 0; }
+.fr-item {
+  display: flex; align-items: baseline; gap: 8px; padding: 8px 0;
+  border-bottom: 1px solid #eee2c9; font-size: 13.5px; color: var(--navy);
+}
+.fr-item:last-child { border-bottom: none; }
+.fr-item-text { flex: 1 1 auto; }
+.fr-item-date { color: #8a7f63; font-size: 11.5px; white-space: nowrap; }
+.fr-complete-btn {
+  background: #fff; border: 1px solid var(--gold); color: var(--gold); border-radius: 3px;
+  font-size: 11px; letter-spacing: 0.3px; text-transform: uppercase; padding: 3px 8px;
+  cursor: pointer; white-space: nowrap;
+}
+.fr-complete-btn:hover { background: var(--gold); color: #fff; }
+.fr-item-done .fr-item-text { text-decoration: line-through; color: #9a9a9a; }
+.fr-undo-link { font-size: 11.5px; color: var(--gold); white-space: nowrap; cursor: pointer; }
+.fr-done-section { margin-top: 10px; }
+.fr-done-toggle {
+  background: none; border: none; color: #8a7f63; font-size: 12px; cursor: pointer;
+  padding: 0; text-decoration: underline;
+}
+"""
+
+FEATURE_REQUEST_PANEL_JS = """
+(function () {
+  "use strict";
+  var panel = document.getElementById("feature-request-panel");
+  if (!panel) { return; }
+
+  var mode = panel.getAttribute("data-mode");
+  var adminKey = panel.getAttribute("data-admin-key") || "";
+
+  var input = panel.querySelector(".fr-input");
+  var statusEl = panel.querySelector(".fr-status");
+  var openList = panel.querySelector(".fr-open-list");
+  var doneSection = panel.querySelector(".fr-done-section");
+  var doneList = panel.querySelector(".fr-done-list");
+  var doneToggle = panel.querySelector(".fr-done-toggle");
+  var doneCount = panel.querySelector(".fr-done-count");
+
+  function currentPageLabel() {
+    if (mode === "admin") { return "admin"; }
+    var activeStep = document.querySelector(".step.active");
+    return activeStep ? "Step " + activeStep.getAttribute("data-step") : "";
+  }
+
+  function authPayload(extra) {
+    var payload = {};
+    for (var k in extra) { if (Object.prototype.hasOwnProperty.call(extra, k)) { payload[k] = extra[k]; } }
+    if (mode === "admin") { payload.key = adminKey; } else { payload.notes = "glen"; }
+    return payload;
+  }
+
+  function postJson(payload) {
+    return fetch("/", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }).then(function (r) { return r.json().then(function (data) { return { status: r.status, body: data }; }); });
+  }
+
+  function formatDate(iso) {
+    if (!iso) { return ""; }
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) { return iso; }
+    return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  }
+
+  function render(requests) {
+    var open = requests.filter(function (r) { return !r.done; })
+      .sort(function (a, b) { return (a.created_at || "").localeCompare(b.created_at || ""); });
+    var done = requests.filter(function (r) { return r.done; })
+      .sort(function (a, b) { return (a.created_at || "").localeCompare(b.created_at || ""); });
+
+    openList.innerHTML = "";
+    open.forEach(function (r) {
+      var li = document.createElement("li");
+      li.className = "fr-item";
+      var text = document.createElement("span");
+      text.className = "fr-item-text";
+      text.textContent = r.text;
+      var date = document.createElement("span");
+      date.className = "fr-item-date";
+      date.textContent = formatDate(r.created_at);
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "fr-complete-btn";
+      btn.textContent = "\\u2713 Mark complete";
+      btn.addEventListener("click", function () { toggle(r.id, true); });
+      li.appendChild(text);
+      li.appendChild(date);
+      li.appendChild(btn);
+      openList.appendChild(li);
+    });
+
+    doneList.innerHTML = "";
+    done.forEach(function (r) {
+      var li = document.createElement("li");
+      li.className = "fr-item fr-item-done";
+      var text = document.createElement("span");
+      text.className = "fr-item-text";
+      text.textContent = r.text;
+      var undo = document.createElement("a");
+      undo.className = "fr-undo-link";
+      undo.textContent = "undo";
+      undo.addEventListener("click", function (e) { e.preventDefault(); toggle(r.id, false); });
+      li.appendChild(text);
+      li.appendChild(undo);
+      doneList.appendChild(li);
+    });
+    doneCount.textContent = String(done.length);
+    doneSection.style.display = done.length ? "block" : "none";
+  }
+
+  function loadList() {
+    postJson(authPayload({ action: "feature_request_list" })).then(function (res) {
+      if (res.body && res.body.ok) { render(res.body.requests || []); }
+    }).catch(function () {});
+  }
+
+  function toggle(id, done) {
+    postJson(authPayload({ action: "feature_request", id: id, done: done })).then(function (res) {
+      if (res.body && res.body.ok) { loadList(); }
+    }).catch(function () {});
+  }
+
+  if (doneToggle) {
+    doneToggle.addEventListener("click", function () {
+      doneList.style.display = doneList.style.display === "none" ? "block" : "none";
+    });
+  }
+
+  if (input) {
+    input.addEventListener("keydown", function (e) {
+      if (e.key !== "Enter") { return; }
+      var text = input.value.trim();
+      if (!text) { return; }
+      input.disabled = true;
+      statusEl.textContent = "";
+      postJson(authPayload({ action: "feature_request", text: text, page: currentPageLabel(), website: "" }))
+        .then(function (res) {
+          input.disabled = false;
+          if (res.body && res.body.ok) {
+            input.value = "";
+            loadList();
+          } else {
+            statusEl.textContent = (res.body && res.body.message) || "Couldn't save that just now.";
+          }
+        })
+        .catch(function () {
+          input.disabled = false;
+          statusEl.textContent = "Network error. Please try again.";
+        });
+    });
+  }
+
+  loadList();
+})();
+"""
+
+# ADMIN_PAGE_RENDERED was computed before these constants existed; patch the
+# feature-request panel's CSS/JS into it now (module load only runs once, so
+# this is a one-time fixup, not a per-request cost).
+ADMIN_PAGE_RENDERED = ADMIN_PAGE_RENDERED.replace(
+    "</style>", FEATURE_REQUEST_PANEL_CSS + "</style>", 1
+).replace(
+    "</body>", f"<script>{FEATURE_REQUEST_PANEL_JS}</script>\n</body>", 1
+)
+
+
+def build_feature_request_panel_html(mode, admin_key=None):
+    admin_key_attr = f" data-admin-key='{html.escape(admin_key, quote=True)}'" if admin_key else ""
+    return (
+        f"<div class='fr-panel' id='feature-request-panel' data-mode='{mode}'{admin_key_attr}>"
+        "<div class='fr-panel-title'>Feature requests</div>"
+        "<input type='text' class='fr-input' maxlength='2000' autocomplete='off' "
+        "placeholder=\"Spot something to fix or add? Type it here and hit Enter — "
+        "it stays on this list until Chad ships it.\">"
+        "<div class='fr-status'></div>"
+        "<ul class='fr-open-list'></ul>"
+        "<div class='fr-done-section' style='display:none;'>"
+        "<button type='button' class='fr-done-toggle'>Done (<span class='fr-done-count'>0</span>)</button>"
+        "<ul class='fr-done-list' style='display:none;'></ul>"
+        "</div>"
+        "</div>"
+    )
+
+
 def build_form_html_with_glen_notes():
     page = FORM_HTML
     for number, anchor, position in GLEN_NOTE_ANCHORS:
@@ -2074,8 +2336,20 @@ def build_form_html_with_glen_notes():
         note_html = build_glen_note_html(number)
         replacement = (note_html + anchor) if position == "before" else (anchor + note_html)
         page = page.replace(anchor, replacement, 1)
+
+    # Feature-request panel: one persistent instance inside #form-wrap, right
+    # after the form (so it trails whichever step is currently visible), fed
+    # live via the shared JS module below.
+    fr_anchor = "    </form>\n  </div>"
+    if page.count(fr_anchor) == 1:
+        panel_html = build_feature_request_panel_html("glen")
+        page = page.replace(fr_anchor, fr_anchor + "\n\n  " + panel_html, 1)
+        page = page.replace(
+            "</body>", f"<script>{FEATURE_REQUEST_PANEL_JS}</script>\n</body>", 1
+        )
+
     if "</style>" in page:
-        page = page.replace("</style>", GLEN_NOTES_CSS + "</style>", 1)
+        page = page.replace("</style>", GLEN_NOTES_CSS + FEATURE_REQUEST_PANEL_CSS + "</style>", 1)
     return page
 
 
@@ -2680,12 +2954,168 @@ def handle_agent_search(body, ip):
 # Admin link helper (shared by the submit notification and the sweep)
 # ---------------------------------------------------------------------------
 
-def build_admin_link(submission_id, host=None):
+def build_admin_link(submission_id=None, host=None):
     admin_key = os.environ.get("ADMIN_KEY", "")
     resolved_host = host or os.environ.get(FORM_HOST_ENV_VAR, "")
     if not resolved_host:
         return ""
-    return f"https://{resolved_host}/?view=admin&key={admin_key}&id={submission_id}"
+    link = f"https://{resolved_host}/?view=admin&key={admin_key}"
+    if submission_id:
+        link += f"&id={submission_id}"
+    return link
+
+
+# ---------------------------------------------------------------------------
+# Feature requests: a lightweight standing punch list, stored in the same
+# table under its own form_type so the CEF admin scan (filtered to
+# FORM_TYPE_CEF_NATURAL) and the sweep scan (filtered on a "status"
+# attribute these items never carry) both naturally skip these rows.
+# Visible only on the ?notes=glen view and the admin view -- never on the
+# clean client-facing page.
+# ---------------------------------------------------------------------------
+
+def _feature_request_caller_authorized(body):
+    admin_key = os.environ.get("ADMIN_KEY", "")
+    supplied_key = str(body.get("key", ""))
+    return bool(admin_key) and supplied_key == admin_key or body.get("notes") == "glen"
+
+
+def handle_feature_request_create(body, ip, host):
+    if str(body.get("website", "")).strip():
+        print("route=feature_request status=honeypot")
+        return response_json({"ok": True})
+
+    text = str(body.get("text", "")).strip()
+    if not text:
+        print("route=feature_request status=400")
+        return response_json(
+            {"ok": False, "error": "empty_text", "message": "Type something before hitting Enter."}, 400
+        )
+    text = text[:FEATURE_REQUEST_MAX_LEN]
+
+    # Shared with the submission/draft rate limit -- this box is a
+    # convenience, not something worth a separate budget.
+    if not check_rate_limit(ip):
+        print("route=feature_request status=429")
+        return response_json(
+            {
+                "ok": False,
+                "error": "rate_limited",
+                "message": "Too many requests from this connection right now. Please try again in a few minutes.",
+            },
+            429,
+        )
+
+    page = str(body.get("page", "")).strip()[:100]
+    request_id = "fr#" + str(uuid.uuid4())
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+    item = dynamodb_safe({
+        "submission_id": request_id,
+        "form_type": FORM_TYPE_FEATURE_REQUEST,
+        "text": text,
+        "page": page,
+        "created_at": now,
+        "done": False,
+    })
+    try:
+        table.put_item(Item=item)
+    except ClientError as e:
+        error_code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        print(f"route=feature_request status=500 error={type(e).__name__}:{error_code}")
+        return response_json(
+            {"ok": False, "error": "storage_failed", "message": "Couldn't save that just now. Please try again."},
+            500,
+        )
+
+    try:
+        admin_link = build_admin_link(host=host)
+        lines = [text, "", f"Page: {page or '-'}"]
+        if admin_link:
+            lines.append("")
+            lines.append(admin_link)
+        ses.send_email(
+            Source=SES_SENDER,
+            Destination={"ToAddresses": [SES_REPLY_TO]},
+            Message={
+                "Subject": {"Data": "RMS Forms feature request"},
+                "Body": {"Text": {"Data": "\n".join(lines) + "\n"}},
+            },
+            ReplyToAddresses=[SES_REPLY_TO],
+        )
+    except Exception:
+        print(f"route=feature_request status=email_failed request_id={request_id}")
+
+    print(f"route=feature_request status=200 request_id={request_id}")
+    return response_json({"ok": True, "id": request_id})
+
+
+def handle_feature_request_toggle(body, host):
+    if not _feature_request_caller_authorized(body):
+        print("route=feature_request_toggle status=403")
+        return response_text("Forbidden", 403)
+
+    request_id = str(body.get("id", "")).strip()
+    if not request_id:
+        return response_json({"ok": False, "error": "missing_id"}, 400)
+
+    try:
+        existing = table.get_item(Key={"submission_id": request_id}).get("Item")
+    except ClientError:
+        existing = None
+    if not existing or existing.get("form_type") != FORM_TYPE_FEATURE_REQUEST:
+        print("route=feature_request_toggle status=404")
+        return response_json({"ok": False, "error": "not_found"}, 404)
+
+    done = bool(body.get("done"))
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+    try:
+        if done:
+            table.update_item(
+                Key={"submission_id": request_id},
+                UpdateExpression="SET #done = :done, #done_at = :done_at",
+                ExpressionAttributeNames={"#done": "done", "#done_at": "done_at"},
+                ExpressionAttributeValues={":done": True, ":done_at": now},
+            )
+        else:
+            table.update_item(
+                Key={"submission_id": request_id},
+                UpdateExpression="SET #done = :done REMOVE #done_at",
+                ExpressionAttributeNames={"#done": "done", "#done_at": "done_at"},
+                ExpressionAttributeValues={":done": False},
+            )
+    except ClientError as e:
+        error_code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        print(f"route=feature_request_toggle status=500 error={type(e).__name__}:{error_code}")
+        return response_json({"ok": False, "error": "storage_failed"}, 500)
+
+    print(f"route=feature_request_toggle status=200 request_id={request_id} done={done}")
+    return response_json({"ok": True})
+
+
+def handle_feature_request_list(body):
+    try:
+        resp = table.scan(FilterExpression=Attr("form_type").eq(FORM_TYPE_FEATURE_REQUEST))
+        items = resp.get("Items", [])
+        while "LastEvaluatedKey" in resp:
+            resp = table.scan(
+                FilterExpression=Attr("form_type").eq(FORM_TYPE_FEATURE_REQUEST),
+                ExclusiveStartKey=resp["LastEvaluatedKey"],
+            )
+            items.extend(resp.get("Items", []))
+    except ClientError:
+        items = []
+
+    requests = [
+        {
+            "id": it.get("submission_id"),
+            "text": it.get("text", ""),
+            "page": it.get("page", ""),
+            "created_at": it.get("created_at", ""),
+            "done": bool(it.get("done")),
+        }
+        for it in items
+    ]
+    return response_json({"ok": True, "requests": requests})
 
 
 # ---------------------------------------------------------------------------
@@ -3181,7 +3611,8 @@ def render_admin_list(admin_key):
         f"</tr></thead><tbody>{rows_html}</tbody></table>"
     )
 
-    content = f"<h1>Client Engagement Form Submissions</h1>{table_html}"
+    fr_panel_html = build_feature_request_panel_html("admin", admin_key=admin_key)
+    content = f"{fr_panel_html}<h1>Client Engagement Form Submissions</h1>{table_html}"
     return response_html(wrap_admin_page(content))
 
 
@@ -3321,6 +3752,12 @@ def lambda_handler(event, context):
                 return handle_draft(body, ip)
             if action == "agent_search":
                 return handle_agent_search(body, ip)
+            if action == "feature_request":
+                if "id" in body:
+                    return handle_feature_request_toggle(body, host)
+                return handle_feature_request_create(body, ip, host)
+            if action == "feature_request_list":
+                return handle_feature_request_list(body)
             print("route=unknown_action status=400")
             return response_json({"ok": False, "error": "unknown_action"}, 400)
 
