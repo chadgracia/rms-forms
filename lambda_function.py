@@ -19,7 +19,7 @@ SES_REPLY_TO = "cgracia@rainmakersecurities.com"
 AGENT_EMAIL_DOMAIN = "@rainmakersecurities.com"
 FORM_TYPE_CEF_NATURAL = "cef-natural"
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
-RATE_LIMIT_PER_HOUR = 5
+RATE_LIMIT_PER_HOUR = 20
 
 ALLOWED_UPLOAD_EXTENSIONS = {
     "jpg": ("image/jpeg", "image/jpg"),
@@ -78,7 +78,7 @@ OCCUPATION_OPTIONS = (
     "Venture Capital / Private Equity", "Not Employed", "Other",
 )
 
-ELIGIBILITY_WARNING_TEXT = "Not eligible for private secondary transactions."
+ELIGIBILITY_WARNING_TEXT = "May not be eligible for private secondary transactions."
 
 # Referring Agent roster shown on Step 1 when no ?agent= URL param is present.
 # Source of truth for the dropdown and for resolving/validating a selection.
@@ -373,6 +373,17 @@ details.patriot-section p { margin: 12px 0; }
   padding: 10px 14px; border-radius: 4px; margin-top: 8px; font-size: 13px;
 }
 .not-eligible-tag { color: #c0392b; font-weight: 700; font-size: 11px; margin-left: 6px; white-space: nowrap; }
+#employer-address-block.address-block-disabled { opacity: 0.45; pointer-events: none; }
+.agent-typeahead { position: relative; }
+.agent-suggestions {
+  list-style: none; margin: 4px 0 0; padding: 4px 0; position: absolute; left: 0; right: 0;
+  background: #fff; border: 1px solid #ccc6b8; border-radius: 2px; max-height: 220px;
+  overflow-y: auto; z-index: 20; box-shadow: 0 4px 10px rgba(0, 0, 0, 0.08);
+}
+.agent-suggestions li { padding: 8px 12px; font-size: 14px; cursor: pointer; }
+.agent-suggestions li:hover, .agent-suggestions li.active { background: #faf6ee; }
+.agent-suggestions li.agent-suggestion-special { border-top: 1px solid #e3ded0; color: #7a7563; font-style: italic; }
+.agent-email-display { max-width: 300px; background: #f3f1ea; color: #6b6a63; }
 .nav-buttons { display: flex; justify-content: space-between; margin-top: 32px; }
 .step { display: none; }
 .step.active { display: block; }
@@ -456,16 +467,6 @@ def build_country_options_html(default="United States"):
     return "".join(parts)
 
 
-def build_agent_roster_options_html():
-    parts = ["<option value=''>Select your Rainmaker Securities Agent&#8230;</option>"]
-    for display_name, _email in AGENT_ROSTER:
-        esc = html.escape(display_name)
-        parts.append(f"<option value='{esc}'>{esc}</option>")
-    parts.append("<option value='__none__'>No referring agent</option>")
-    parts.append("<option value='__manual__'>My agent is not listed (enter manually)</option>")
-    return "".join(parts)
-
-
 def build_agent_roster_js_map():
     entries = {}
     for display_name, email in AGENT_ROSTER:
@@ -483,7 +484,6 @@ INVESTMENT_OBJECTIVES_CHECKS_HTML = build_checkbox_options_html("investment_obje
 PREVIOUS_INVESTMENT_CHECKS_HTML = build_checkbox_options_html("previous_investment_types", PREVIOUS_INVESTMENT_OPTIONS)
 SOPHISTICATION_CHECKS_HTML = build_checkbox_options_html("client_sophistication", SOPHISTICATION_OPTIONS)
 COUNTRY_OPTIONS_HTML = build_country_options_html()
-AGENT_ROSTER_OPTIONS_HTML = build_agent_roster_options_html()
 AGENT_ROSTER_JS_MAP = build_agent_roster_js_map()
 RETIRING_RADIOS_HTML = build_yesno_radios("retiring_five_years")
 Q1_RADIOS_HTML = build_yesno_radios("q_private_equity_five_years")
@@ -543,8 +543,15 @@ __HEADER__
 
         <div id="referring-agent-section">
           <div class="field" data-field="agent_roster" id="agent-roster-wrap" style="display:none;">
-            <label class="field-label" for="agent_roster">Who is the Rainmaker Securities Agent that referred the Client to this form?</label>
-            <select id="agent_roster">__AGENT_ROSTER_OPTIONS__</select>
+            <label class="field-label" for="agent_search">Who is the Rainmaker Securities Agent that referred the Client to this form?</label>
+            <div class="agent-typeahead">
+              <input type="text" id="agent_search" autocomplete="off" placeholder="Type the first or last name of the agent who referred you here.">
+              <ul class="agent-suggestions" id="agent_suggestions" style="display:none;"></ul>
+            </div>
+            <div class="field" id="agent-email-display-wrap" style="display:none; margin-top:10px;">
+              <label class="field-label" for="agent_email_display">Agent email (for your records)</label>
+              <input type="text" id="agent_email_display" class="agent-email-display" readonly disabled>
+            </div>
             <div class="field-error"></div>
           </div>
 
@@ -700,26 +707,28 @@ __HEADER__
           <input type="text" id="employer_name" name="employer_name" placeholder="or type NONE">
         </div>
 
-        <h3>Address of Employer</h3>
-        <div class="field" data-field="employer_country">
-          <label class="field-label" for="employer_country">Country</label>
-          <select id="employer_country" name="employer_country">__COUNTRY_OPTIONS__</select>
-        </div>
-        <div class="two-col">
-          <div class="field" data-field="employer_city">
-            <label class="field-label" for="employer_city">City</label>
-            <input type="text" id="employer_city" name="employer_city">
+        <div id="employer-address-block">
+          <h3>Address of Employer</h3>
+          <div class="field" data-field="employer_country">
+            <label class="field-label" for="employer_country">Country</label>
+            <select id="employer_country" name="employer_country">__COUNTRY_OPTIONS__</select>
           </div>
-          <div class="field" data-field="employer_state" id="employer_state_wrap">
-            <label class="field-label" for="employer_state">State/Province</label>
-            <input type="text" id="employer_state" name="employer_state">
+          <div class="two-col">
+            <div class="field" data-field="employer_city">
+              <label class="field-label" for="employer_city">City</label>
+              <input type="text" id="employer_city" name="employer_city">
+            </div>
+            <div class="field" data-field="employer_state" id="employer_state_wrap">
+              <label class="field-label" for="employer_state">State/Province</label>
+              <input type="text" id="employer_state" name="employer_state">
+            </div>
           </div>
-        </div>
-        <div class="field" data-field="employer_zip" id="employer_zip_wrap">
-          <label class="field-label" for="employer_zip">Postal/Zip Code</label>
-          <input type="text" id="employer_zip" name="employer_zip">
-          <div class="helper-text" id="employer-zip-helper" style="display:none;">Format: 12345 or 12345-6789</div>
-          <div class="field-error"></div>
+          <div class="field" data-field="employer_zip" id="employer_zip_wrap">
+            <label class="field-label" for="employer_zip">Postal/Zip Code</label>
+            <input type="text" id="employer_zip" name="employer_zip">
+            <div class="helper-text" id="employer-zip-helper" style="display:none;">Format: 12345 or 12345-6789</div>
+            <div class="field-error"></div>
+          </div>
         </div>
 
         <div class="field" data-field="retiring_five_years">
@@ -730,14 +739,14 @@ __HEADER__
         <div class="field" data-field="net_worth">
           <label class="field-label" for="net_worth">Net Worth Excluding Primary Residence</label>
           <select id="net_worth" name="net_worth">__NET_WORTH_SELECT__</select>
-          <div class="eligibility-warning" id="net_worth-warning" style="display:none;">Not eligible for private secondary transactions.</div>
+          <div class="eligibility-warning" id="net_worth-warning" style="display:none;">May not be eligible for private secondary transactions.</div>
           <div class="field-error"></div>
         </div>
 
         <div class="field" data-field="cumulative_investments">
           <label class="field-label" for="cumulative_investments">Cumulative Amount of Investments</label>
           <select id="cumulative_investments" name="cumulative_investments">__CUMULATIVE_SELECT__</select>
-          <div class="eligibility-warning" id="cumulative_investments-warning" style="display:none;">Not eligible for private secondary transactions.</div>
+          <div class="eligibility-warning" id="cumulative_investments-warning" style="display:none;">May not be eligible for private secondary transactions.</div>
           <div class="field-error"></div>
         </div>
 
@@ -763,7 +772,7 @@ __HEADER__
 
         <div class="field" data-field="years_experience">
           <label class="field-label" for="years_experience">Client's years of experience buying and selling securities</label>
-          <input type="number" id="years_experience" name="years_experience" min="0" max="80">
+          <input type="number" id="years_experience" name="years_experience" min="0" max="80" style="max-width:90px;">
           <div class="field-error"></div>
         </div>
 
@@ -848,6 +857,7 @@ __HEADER__
 
   var currentStep = 1;
   var totalSteps = 3;
+  var agentSelectionKey = null;
 
   function qs(sel, root) { return (root || document).querySelector(sel); }
   function qsa(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
@@ -922,8 +932,8 @@ __HEADER__
 
     var rosterWrap = qs("#agent-roster-wrap");
     var rosterVisible = rosterWrap && rosterWrap.style.display !== "none";
-    if (rosterVisible) {
-      if (!qs("#agent_roster").value) { showFieldError("agent_roster", "Select your Rainmaker Securities Agent."); ok = false; }
+    if (rosterVisible && !isManualAgentFieldsVisible()) {
+      if (!agentSelectionKey) { showFieldError("agent_roster", "Select your Rainmaker Securities Agent."); ok = false; }
       else { clearFieldError("agent_roster"); }
     }
 
@@ -1094,11 +1104,7 @@ __HEADER__
           qs("#success-screen").style.display = "block";
           qs("#success-id").textContent = res.body.submission_id;
           window.scrollTo({ top: 0, behavior: "smooth" });
-        } else if (res.status === 429) {
-          alert(res.body.message || "Too many submissions. Please try again later.");
-          btn.disabled = false;
-          btn.textContent = "Submit";
-        } else if (res.body && res.body.errors) {
+        } else if (res.body && res.body.errors && Object.keys(res.body.errors).length) {
           clearAllErrors();
           var firstField = null;
           Object.keys(res.body.errors).forEach(function (f) {
@@ -1106,6 +1112,10 @@ __HEADER__
             showFieldError(f, res.body.errors[f]);
           });
           if (firstField) { focusAndScroll(firstField); }
+          btn.disabled = false;
+          btn.textContent = "Submit";
+        } else if (res.body && res.body.message) {
+          alert(res.body.message);
           btn.disabled = false;
           btn.textContent = "Submit";
         } else {
@@ -1176,19 +1186,57 @@ __HEADER__
     // ?agent= present: same exact lock behavior as before, roster stays hidden.
     if (agent) { return; }
 
-    // Raw link (no ?agent=): show the roster dropdown, hide the free-text
-    // fields until "My agent is not listed" is chosen.
+    // Raw link (no ?agent=): show the type-ahead agent search, hide the
+    // free-text fields until "My agent is not listed" is chosen or a
+    // roster match is picked.
     var rosterWrap = qs("#agent-roster-wrap");
     var manualNames = qs("#agent-manual-names");
     var emailWrap = qs("#agent-email-wrap");
+    var searchInput = qs("#agent_search");
+    var suggestionsList = qs("#agent_suggestions");
+    var emailDisplayWrap = qs("#agent-email-display-wrap");
+    var emailDisplay = qs("#agent_email_display");
+    var rosterNames = Object.keys(AGENT_ROSTER_MAP).filter(function (k) { return k !== "__none__"; });
+
     rosterWrap.style.display = "block";
     manualNames.style.display = "none";
     emailWrap.style.display = "none";
 
-    qs("#agent_roster").addEventListener("change", function () {
-      var value = this.value;
+    function hideSuggestions() { suggestionsList.style.display = "none"; }
+
+    function renderSuggestions(query) {
+      var q = query.trim().toLowerCase();
+      var matches = q ? rosterNames.filter(function (name) {
+        var r = AGENT_ROSTER_MAP[name];
+        return r.first.toLowerCase().indexOf(q) !== -1 || r.last.toLowerCase().indexOf(q) !== -1 || name.toLowerCase().indexOf(q) !== -1;
+      }) : rosterNames;
+      suggestionsList.innerHTML = "";
+      matches.forEach(function (name) {
+        var li = document.createElement("li");
+        li.textContent = name;
+        li.addEventListener("mousedown", function (e) { e.preventDefault(); selectAgent(name); });
+        suggestionsList.appendChild(li);
+      });
+      var noneLi = document.createElement("li");
+      noneLi.className = "agent-suggestion-special";
+      noneLi.textContent = "No referring agent";
+      noneLi.addEventListener("mousedown", function (e) { e.preventDefault(); selectAgent("__none__"); });
+      suggestionsList.appendChild(noneLi);
+      var manualLi = document.createElement("li");
+      manualLi.className = "agent-suggestion-special";
+      manualLi.textContent = "My agent is not listed";
+      manualLi.addEventListener("mousedown", function (e) { e.preventDefault(); selectAgent("__manual__"); });
+      suggestionsList.appendChild(manualLi);
+      suggestionsList.style.display = "block";
+    }
+
+    function selectAgent(key) {
+      agentSelectionKey = key;
       clearFieldError("agent_roster");
-      if (value === "__manual__") {
+      hideSuggestions();
+      if (key === "__manual__") {
+        searchInput.value = "";
+        emailDisplayWrap.style.display = "none";
         manualNames.style.display = "flex";
         emailWrap.style.display = "block";
         qs("#agent_first_name").value = "";
@@ -1197,15 +1245,35 @@ __HEADER__
         clearFieldError("agent_first_name");
         clearFieldError("agent_last_name");
         clearFieldError("agent_email");
-      } else {
-        manualNames.style.display = "none";
-        emailWrap.style.display = "none";
-        var resolved = AGENT_ROSTER_MAP[value];
-        qs("#agent_first_name").value = resolved ? resolved.first : "";
-        qs("#agent_last_name").value = resolved ? resolved.last : "";
-        qs("#agent_email").value = resolved ? resolved.email : "";
+        return;
       }
+      manualNames.style.display = "none";
+      emailWrap.style.display = "none";
+      var resolved = AGENT_ROSTER_MAP[key];
+      searchInput.value = key === "__none__" ? "No referring agent" : key;
+      qs("#agent_first_name").value = resolved ? resolved.first : "";
+      qs("#agent_last_name").value = resolved ? resolved.last : "";
+      qs("#agent_email").value = resolved ? resolved.email : "";
+      if (resolved) {
+        emailDisplay.value = resolved.email;
+        emailDisplayWrap.style.display = "block";
+      } else {
+        emailDisplayWrap.style.display = "none";
+      }
+    }
+
+    searchInput.addEventListener("input", function () {
+      agentSelectionKey = null;
+      emailDisplayWrap.style.display = "none";
+      manualNames.style.display = "none";
+      emailWrap.style.display = "none";
+      qs("#agent_first_name").value = "";
+      qs("#agent_last_name").value = "";
+      qs("#agent_email").value = "";
+      renderSuggestions(searchInput.value);
     });
+    searchInput.addEventListener("focus", function () { renderSuggestions(searchInput.value); });
+    searchInput.addEventListener("blur", function () { hideSuggestions(); });
   }
   initReferringAgent();
 
@@ -1328,6 +1396,28 @@ __HEADER__
     hideZipWhenNonUS: true
   });
 
+  function hasEmployerName() {
+    var v = qs("#employer_name").value.trim();
+    return v !== "" && v.toUpperCase() !== "NONE";
+  }
+
+  function updateEmployerAddressState() {
+    var block = qs("#employer-address-block");
+    var enabled = hasEmployerName();
+    block.classList.toggle("address-block-disabled", !enabled);
+    qsa("input, select", block).forEach(function (el) { el.disabled = !enabled; });
+    if (!enabled) {
+      qs("#employer_city").value = "";
+      var stateEl = qs("#employer_state");
+      if (stateEl) { stateEl.value = ""; }
+      qs("#employer_zip").value = "";
+      clearFieldError("employer_state");
+      clearFieldError("employer_zip");
+    }
+  }
+  qs("#employer_name").addEventListener("input", updateEmployerAddressState);
+  updateEmployerAddressState();
+
   var occupationSelect = qs("#occupation");
   if (occupationSelect) {
     occupationSelect.addEventListener("change", function () {
@@ -1381,7 +1471,6 @@ def render_form_page():
     page = page.replace("__SHARED_CSS__", SHARED_CSS)
     page = page.replace("__HEADER__", SHARED_HEADER)
     page = page.replace("__COUNTRY_OPTIONS__", COUNTRY_OPTIONS_HTML)
-    page = page.replace("__AGENT_ROSTER_OPTIONS__", AGENT_ROSTER_OPTIONS_HTML)
     page = page.replace("__AGENT_ROSTER_JS_MAP__", AGENT_ROSTER_JS_MAP)
     page = page.replace("__RETIRING_RADIOS__", RETIRING_RADIOS_HTML)
     page = page.replace("__OCCUPATION_OPTIONS__", OCCUPATION_OPTIONS_HTML)
@@ -1411,7 +1500,7 @@ ADMIN_PAGE_RENDERED = ADMIN_PAGE_TEMPLATE.replace("__SHARED_CSS__", SHARED_CSS).
 
 GLEN_NOTE_TEXTS = {
     1: "Glen: You're viewing the annotated version — these margin notes appear only on this private preview link. Clients see a clean form with none of this.",
-    2: "Glen: Two paths, both foolproof: each agent gets a personal link that pre-fills and locks their name — and if a raw link circulates, the client picks the agent from the official roster instead of typing. Either way, every submission arrives correctly attributed. No more blank, misspelled, or unknown agent fields.",
+    2: "Glen: Two paths, both foolproof: each agent gets a personal link that pre-fills and locks their name — and if a raw link circulates, the client picks the agent from the official roster instead of typing. Either way, every submission arrives correctly attributed. No more blank, misspelled, or unknown agent fields. If the client selects 'No referring agent', the form auto-routes to ops@rainmakersecurities.com — nothing lands unassigned.",
     3: "Glen: The text at left describes the end state; the upload itself is switched off until RMS confirms where these documents should live. The design is worth the wait: the ID gets encrypted in the client's browser with an RMS-held key, so it lands in storage as ciphertext that only RMS compliance can open — I can't see it, and no other agent can either. My recommendation: we stop emailing ID copies to referring brokers entirely, as happens today. The broker receives the engagement form data; the ID goes to RMS only. Fewer copies of passports sitting in fewer inboxes.",
     4: "Glen: Country now comes first and drives the rest: US clients get a proper state dropdown, the form pre-populates city and state from the zip code, and zip code errors are disallowed at entry. Bad addresses can no longer reach us.",
     5: "Glen: Every identification field is now required and format-checked before the client can advance — fewer incomplete forms, fewer repeat requests back to the client.",
@@ -1419,6 +1508,7 @@ GLEN_NOTE_TEXTS = {
     7: "Glen: It's not possible to have more than one net worth, so I switched these from check-all-that-apply to single-choice dropdowns. Same for annual income. One clean answer per question.",
     8: "Glen: If a client selects NONE OF THE ABOVE for net worth or investments, they see an immediate eligibility warning and the submission is flagged in the admin view — we catch unqualified clients at the door instead of after the paperwork.",
     9: "Glen: Everything on this form is validated the moment it's typed, and the whole thing is re-checked on our server before it's stored — so what lands in the database is complete, consistent, and correctly attributed on the first pass.",
+    10: "Glen: On submit, the client sees a thank-you screen with any text we want. Behind it, a full copy goes to the RMS team and a summary goes to the referring agent automatically — with the ID and anything else we choose stripped out of the agent's copy.",
 }
 
 # Each entry: (note number, unique anchor substring already present in
@@ -1434,6 +1524,7 @@ GLEN_NOTE_ANCHORS = [
     (7, '<div class="field" data-field="net_worth">', "before"),
     (8, '<div class="field" data-field="cumulative_investments">', "before"),
     (9, '<div class="field" data-field="attestation">', "before"),
+    (10, 'I have refused to provide any missing information.\n          </label>', "after"),
 ]
 
 GLEN_NOTES_CSS = """
@@ -1709,22 +1800,28 @@ def validate_submission(raw):
                     data["occupation_other"] = occupation_other[:200]
 
     opt_text("employer_name")
+    employer_name_val = str(raw.get("employer_name", "")).strip()
+    has_employer = bool(employer_name_val) and employer_name_val.upper() != "NONE"
 
+    # Address of Employer fields are ignored entirely (never stored, never
+    # format-checked) when there is no employer name — matches the client
+    # collapsing/disabling that block in that case.
     employer_country = None
-    if not is_blank(raw.get("employer_country")):
+    if has_employer and not is_blank(raw.get("employer_country")):
         employer_country = str(raw.get("employer_country")).strip()
         data["employer_country"] = employer_country
 
-    opt_text("employer_city")
+    if has_employer:
+        opt_text("employer_city")
 
     employer_state = str(raw.get("employer_state", "")).strip()
-    if employer_state:
+    if has_employer and employer_state:
         if employer_country == "United States" and employer_state not in US_STATES:
             errors["employer_state"] = "Select a valid US state."
         else:
             data["employer_state"] = employer_state
 
-    if employer_country == "United States":
+    if has_employer and employer_country == "United States":
         employer_zip = str(raw.get("employer_zip", "")).strip()
         if employer_zip:
             if not US_ZIP_RE.match(employer_zip):
@@ -1875,7 +1972,7 @@ def handle_submit(body, ip, host):
             {
                 "ok": False,
                 "error": "rate_limited",
-                "message": "Too many submissions have been received from this connection. Please try again later.",
+                "message": "Submission limit reached for this hour. Please wait a few minutes and try again.",
             },
             429,
         )
@@ -1899,7 +1996,14 @@ def handle_submit(body, ip, host):
         table.put_item(Item=item)
     except ClientError:
         print(f"route=submit status=500 submission_id={submission_id}")
-        return response_json({"ok": False, "error": "storage_failed"}, 500)
+        return response_json(
+            {
+                "ok": False,
+                "error": "storage_failed",
+                "message": "We couldn't save your submission just now. Please try again in a moment.",
+            },
+            500,
+        )
 
     send_notification_email(data.get("agent_email", ""), item, submission_id, host)
 
@@ -2084,4 +2188,11 @@ def lambda_handler(event, context):
         return response_json({"ok": False, "error": "method_not_allowed"}, 405)
     except Exception as e:
         print(f"route=error status=500 error={type(e).__name__}")
-        return response_json({"ok": False, "error": "server_error"}, 500)
+        return response_json(
+            {
+                "ok": False,
+                "error": "server_error",
+                "message": "We hit an unexpected error processing your request. Please try again in a moment.",
+            },
+            500,
+        )
