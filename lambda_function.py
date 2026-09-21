@@ -13,7 +13,6 @@ from urllib.parse import parse_qs, quote
 import boto3
 from boto3.dynamodb.conditions import Attr
 from botocore.exceptions import ClientError
-from fpdf import FPDF
 
 REGION = "us-east-1"
 TABLE_NAME = "rms-forms"
@@ -28,6 +27,7 @@ RMS_TEAM_EMAIL = "ops@rainmakersecurities.com"
 FORM_HOST_ENV_VAR = "FORM_HOST"
 FORM_TYPE_CEF_NATURAL = "cef-natural"
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+PDF_MAX_BYTES = 500 * 1024
 RATE_LIMIT_PER_HOUR = 20
 AGENT_SEARCH_RATE_LIMIT_PER_HOUR = 60
 AGENT_SEARCH_MIN_QUERY_LEN = 3
@@ -535,6 +535,10 @@ FORM_PAGE_TEMPLATE = """<!DOCTYPE html>
 <style>
 __SHARED_CSS__
 </style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script>
+  window.jsPDF = window.jspdf && window.jspdf.jsPDF;
+</script>
 </head>
 <body>
 __HEADER__
@@ -1161,13 +1165,17 @@ __HEADER__
     return invalid ? invalid.getAttribute("data-field") : null;
   }
 
+  function ensureDraftId() {
+    if (!draftId && window.crypto && typeof window.crypto.randomUUID === "function") {
+      draftId = window.crypto.randomUUID();
+    }
+    return draftId;
+  }
+
   function saveDraft(step) {
     // Fire-and-forget partial-submission capture: a failed draft save must
     // never interrupt the client, so every error path here is swallowed.
-    if (!draftId) {
-      if (!(window.crypto && typeof window.crypto.randomUUID === "function")) { return; }
-      draftId = window.crypto.randomUUID();
-    }
+    if (!ensureDraftId()) { return; }
     try {
       var payload = collectFormData();
       payload.action = "draft";
@@ -1223,20 +1231,216 @@ __HEADER__
     return data;
   }
 
-  function downloadBase64Pdf(b64, filename) {
-    var byteChars = atob(b64);
-    var byteNumbers = new Array(byteChars.length);
-    for (var i = 0; i < byteChars.length; i++) { byteNumbers[i] = byteChars.charCodeAt(i); }
-    var byteArray = new Uint8Array(byteNumbers);
-    var blob = new Blob([byteArray], { type: "application/pdf" });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement("a");
-    a.href = url;
-    a.download = filename || "CEF.pdf";
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  // ---------------------------------------------------------------------
+  // Client-side PDF generation (jsPDF) -- one-page A4 Client Engagement
+  // Form summary, built entirely in the browser. Two variants: "rms" (the
+  // complete record) and "broker" (identical, Tax ID masked to its last 4
+  // digits). Never allowed to block a submission: every call site wraps
+  // this in a try/catch and treats a missing/failed jsPDF as "no PDF".
+  // ---------------------------------------------------------------------
+  var PDF_NAVY = [27, 42, 74];
+  var PDF_GOLD = [185, 151, 91];
+  var PDF_RED = [192, 57, 43];
+  var PDF_GREY = [90, 90, 90];
+  var PDF_MARGIN = 40;
+  var PDF_HEADER_H = 68;
+  var PDF_FOOTER_RESERVE = 50;
+
+  function pdfJoinList(values, extra) {
+    var text = (Array.isArray(values) && values.length) ? values.join(", ") : "-";
+    if (extra) { text = (text !== "-") ? (text + " (Other: " + extra + ")") : ("Other: " + extra); }
+    return text;
+  }
+  function pdfYesNoVal(v) { return (v === "Yes" || v === "No") ? v : "-"; }
+  function maskTaxIdVal(taxId) {
+    var s = String(taxId || "").trim();
+    if (!s) return "-";
+    if (s.length <= 4) return s;
+    return new Array(s.length - 3).join("•") + s.slice(-4);
+  }
+  function arrayBufferToBase64(buffer) {
+    var bytes = new Uint8Array(buffer);
+    var binary = "";
+    var chunkSize = 0x8000;
+    for (var i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+  }
+
+  function buildCefPdfSections(data, submissionId, createdAtStr, maskTax) {
+    var clientName = ((data.client_first_name || "") + " " + (data.client_last_name || "")).trim() || "-";
+    var agentName = ((data.agent_first_name || "") + " " + (data.agent_last_name || "")).trim() || "-";
+
+    var addrLine1Parts = [data.address_street, data.address_street2].filter(Boolean);
+    var addrLine1 = addrLine1Parts.length ? addrLine1Parts.join(", ") : "-";
+    var cityStateZip = [data.address_city, data.address_state, data.address_zip].filter(Boolean).join(", ") || "-";
+
+    var associatedYes = data.associated_person === "other";
+    var associatedText = associatedYes ? "Yes" : "No";
+    if (associatedYes && data.crd_number) { associatedText += " (CRD# " + data.crd_number + ")"; }
+
+    var occupation = data.occupation || "-";
+    if (data.occupation === "Other" && data.occupation_other) { occupation = "Other (" + data.occupation_other + ")"; }
+
+    var hasEmployer = !!(data.employer_name && data.employer_name.trim() && data.employer_name.trim().toUpperCase() !== "NONE");
+    var employerAddr = hasEmployer
+      ? ([data.employer_city, data.employer_state, data.employer_zip, data.employer_country].filter(Boolean).join(", ") || "-")
+      : "-";
+
+    var attestationText = { agent: "Attested by Agent", client: "Attested by Client" }[data.attestation] || "-";
+
+    var topRow = [
+      ["Reference & Date", [
+        ["Reference", submissionId || "-"],
+        ["Date", createdAtStr || "-"]
+      ]],
+      ["Referring Agent", [
+        ["Name", agentName],
+        ["Email", data.agent_email || "-"]
+      ]]
+    ];
+
+    var stacked = [
+      ["Client", [
+        ["Name", clientName],
+        ["Email", data.client_email || "-"],
+        ["Phone", data.client_phone || "-"],
+        ["DOB", data.date_of_birth || "-"]
+      ]],
+      ["Address", [
+        ["Street", addrLine1],
+        ["City / State / Zip", cityStateZip],
+        ["Country", data.address_country || "-"]
+      ]],
+      ["Identification", [
+        ["Tax ID / Gov't ID", maskTax ? maskTaxIdVal(data.tax_id) : (data.tax_id || "-")],
+        ["Associated Person", associatedText]
+      ]],
+      ["Employment", [
+        ["Occupation", occupation],
+        ["Employer", hasEmployer ? data.employer_name : "-"],
+        ["Employer Address", employerAddr]
+      ]],
+      ["Financial Profile", [
+        ["Net Worth", data.net_worth || "-"],
+        ["Cumulative Investments", data.cumulative_investments || "-"],
+        ["Annual Income", data.annual_income || "-"],
+        ["Years Experience", (data.years_experience !== undefined && data.years_experience !== "") ? data.years_experience : "-"]
+      ]],
+      ["Investment Profile", [
+        ["Objectives", pdfJoinList(data.investment_objectives, data.other_objective)],
+        ["Previous Investment Types", pdfJoinList(data.previous_investment_types)],
+        ["Sophistication", pdfJoinList(data.client_sophistication, data.sophistication_other)]
+      ]],
+      ["Suitability", [
+        ["Private equity/debt (past 5 yrs)", pdfYesNoVal(data.q_private_equity_five_years)],
+        ["Can invest w/ limited liquidity need", pdfYesNoVal(data.q_illiquid_investments)],
+        ["Risk tolerance for private securities", pdfYesNoVal(data.q_risk_tolerance)],
+        ["Capable of independent judgement", pdfYesNoVal(data.q_independent_judgement)]
+      ]],
+      ["Attestation", [
+        ["Attestation", attestationText]
+      ]]
+    ];
+    return { topRow: topRow, stacked: stacked };
+  }
+
+  function drawPdfBlock(doc, x, y, w, title, rows, fontSize) {
+    var labelW = w * 0.40;
+    var valueW = w - labelW - 4;
+    var titleSize = fontSize + 1;
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(titleSize);
+    doc.setTextColor(PDF_NAVY[0], PDF_NAVY[1], PDF_NAVY[2]);
+    doc.text(String(title).toUpperCase(), x, y + titleSize * 0.8);
+    y += titleSize * 0.8 + 3;
+    doc.setDrawColor(PDF_GOLD[0], PDF_GOLD[1], PDF_GOLD[2]);
+    doc.setLineWidth(0.6);
+    doc.line(x, y, x + w, y);
+    y += fontSize * 0.6;
+    rows.forEach(function (row) {
+      var label = row[0], value = row[1];
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(fontSize);
+      doc.setTextColor(PDF_GREY[0], PDF_GREY[1], PDF_GREY[2]);
+      doc.text(String(label), x, y + fontSize * 0.8);
+      doc.setFont("helvetica", "normal");
+      doc.setTextColor(PDF_NAVY[0], PDF_NAVY[1], PDF_NAVY[2]);
+      var lines = doc.splitTextToSize(String(value), valueW);
+      doc.text(lines, x + labelW, y + fontSize * 0.8);
+      var lineCount = Array.isArray(lines) ? lines.length : 1;
+      y += Math.max(fontSize * 0.8 + 2, lineCount * (fontSize * 1.15)) + 3;
+    });
+    return y;
+  }
+
+  function renderCefPdf(data, submissionId, createdAtStr, maskTax, fontSize) {
+    var doc = new window.jsPDF({ orientation: "p", unit: "pt", format: "a4" });
+    var pageW = doc.internal.pageSize.getWidth();
+    var pageH = doc.internal.pageSize.getHeight();
+    var contentW = pageW - 2 * PDF_MARGIN;
+    var sections = buildCefPdfSections(data, submissionId, createdAtStr, maskTax);
+
+    doc.setFillColor(PDF_NAVY[0], PDF_NAVY[1], PDF_NAVY[2]);
+    doc.rect(0, 0, pageW, PDF_HEADER_H, "F");
+    doc.setTextColor(255, 255, 255);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(17);
+    doc.text("RAINMAKER SECURITIES", PDF_MARGIN, 30);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(11);
+    doc.text("Client Engagement Form — Natural Person", PDF_MARGIN, 48);
+
+    doc.setFillColor(PDF_GOLD[0], PDF_GOLD[1], PDF_GOLD[2]);
+    doc.rect(0, PDF_HEADER_H, pageW, 3, "F");
+
+    var y = PDF_HEADER_H + 20;
+    var eligibilityWarning = data.net_worth === "NONE OF THE ABOVE" || data.cumulative_investments === "NONE OF THE ABOVE";
+    if (eligibilityWarning) {
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(10.5);
+      doc.setTextColor(PDF_RED[0], PDF_RED[1], PDF_RED[2]);
+      doc.text("May not be eligible for private secondary transactions.", PDF_MARGIN, y);
+      y += 16;
+    }
+
+    var colW = (contentW - 12) / 2;
+    var yLeft = drawPdfBlock(doc, PDF_MARGIN, y, colW, sections.topRow[0][0], sections.topRow[0][1], fontSize);
+    var yRight = drawPdfBlock(doc, PDF_MARGIN + colW + 12, y, colW, sections.topRow[1][0], sections.topRow[1][1], fontSize);
+    y = Math.max(yLeft, yRight) + 6;
+
+    sections.stacked.forEach(function (block) {
+      y = drawPdfBlock(doc, PDF_MARGIN, y, contentW, block[0], block[1], fontSize) + 6;
+    });
+
+    var fits = y <= (pageH - PDF_FOOTER_RESERVE);
+
+    var footerY = pageH - PDF_FOOTER_RESERVE + 10;
+    doc.setDrawColor(PDF_GOLD[0], PDF_GOLD[1], PDF_GOLD[2]);
+    doc.setLineWidth(1);
+    doc.line(PDF_MARGIN, footerY, pageW - PDF_MARGIN, footerY);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8);
+    doc.setTextColor(PDF_NAVY[0], PDF_NAVY[1], PDF_NAVY[2]);
+    doc.text("Rainmaker Securities, LLC — Member FINRA/SIPC — Confidential", PDF_MARGIN, footerY + 12);
+
+    return { doc: doc, fits: fits };
+  }
+
+  function buildCefPdf(data, submissionId, createdAtStr, maskTax) {
+    var sizes = [9.5, 9, 8.5, 8, 7.5, 7, 6.5];
+    var result = null;
+    for (var i = 0; i < sizes.length; i++) {
+      result = renderCefPdf(data, submissionId, createdAtStr, maskTax, sizes[i]);
+      if (result.fits) { break; }
+    }
+    return result.doc;
+  }
+
+  function buildCefPdfFilename(data, submissionId) {
+    var ref = (data.client_last_name || data.client_first_name || "Client").replace(/[^A-Za-z0-9_-]+/g, "") || "Client";
+    return "CEF-" + ref + "-" + String(submissionId || "").slice(0, 8) + ".pdf";
   }
 
   qs("#submit-btn").addEventListener("click", function () {
@@ -1246,7 +1450,26 @@ __HEADER__
     btn.textContent = "Submitting...";
     var payload = collectFormData();
     payload.action = "submit";
+    ensureDraftId();
     if (draftId) { payload.draft_id = draftId; }
+
+    var brokerPdfDoc = null;
+    var brokerPdfFilename = null;
+    if (typeof window.jsPDF === "function") {
+      try {
+        var nowStr = new Date().toISOString();
+        var rmsDoc = buildCefPdf(payload, draftId, nowStr, false);
+        var brokerDoc = buildCefPdf(payload, draftId, nowStr, true);
+        payload.pdf_rms_b64 = arrayBufferToBase64(rmsDoc.output("arraybuffer"));
+        payload.pdf_broker_b64 = arrayBufferToBase64(brokerDoc.output("arraybuffer"));
+        brokerPdfDoc = brokerDoc;
+        brokerPdfFilename = buildCefPdfFilename(payload, draftId);
+      } catch (e) {
+        brokerPdfDoc = null;
+        brokerPdfFilename = null;
+      }
+    }
+
     fetch("/", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1257,11 +1480,11 @@ __HEADER__
           qs("#form-wrap").style.display = "none";
           qs("#success-screen").style.display = "block";
           qs("#success-id").textContent = res.body.submission_id;
-          if (res.body.pdf_b64) {
+          if (brokerPdfDoc) {
             var downloadBtn = qs("#download-pdf-btn");
             downloadBtn.style.display = "inline-block";
             downloadBtn.onclick = function () {
-              downloadBase64Pdf(res.body.pdf_b64, res.body.pdf_filename);
+              brokerPdfDoc.save(brokerPdfFilename || "CEF.pdf");
             };
           }
           window.scrollTo({ top: 0, behavior: "smooth" });
@@ -1894,18 +2117,6 @@ def response_json(obj, status=200):
     }
 
 
-def response_pdf(pdf_bytes, filename, status=200):
-    return {
-        "statusCode": status,
-        "headers": {
-            "Content-Type": "application/pdf",
-            "Content-Disposition": f'attachment; filename="{filename}"',
-        },
-        "body": base64.b64encode(pdf_bytes).decode("ascii"),
-        "isBase64Encoded": True,
-    }
-
-
 def get_json_body(event):
     body = event.get("body") or "{}"
     if event.get("isBase64Encoded"):
@@ -2478,237 +2689,10 @@ def build_admin_link(submission_id, host=None):
 
 
 # ---------------------------------------------------------------------------
-# PDF generation (one-page Client Engagement Form summary)
-# ---------------------------------------------------------------------------
-
-PDF_NAVY = (27, 42, 74)
-PDF_GOLD = (185, 151, 91)
-PDF_RED = (192, 57, 43)
-PDF_GREY = (90, 90, 90)
-PDF_PAGE_FORMAT = "Letter"
-PDF_MARGIN_MM = 14
-PDF_FOOTER_RESERVE_MM = 16
-
-
-PDF_CHAR_TRANSLATION = {
-    "—": "-", "–": "-", "‘": "'", "’": "'",
-    "“": '"', "”": '"', "…": "...", "•": "*", " ": " ",
-}
-
-
-def _pdf_text(value):
-    if value is None or value == "":
-        return "-"
-    text = str(value)
-    for src, dest in PDF_CHAR_TRANSLATION.items():
-        text = text.replace(src, dest)
-    return text.encode("latin-1", "replace").decode("latin-1")
-
-
-def _pdf_join(values, extra=None):
-    if isinstance(values, list) and values:
-        text = ", ".join(str(v) for v in values)
-    else:
-        text = "-"
-    if extra:
-        text = f"{text} (Other: {extra})" if text != "-" else f"Other: {extra}"
-    return text
-
-
-def _pdf_yes_no(value):
-    return value if value in ("Yes", "No") else "-"
-
-
-def _mask_tax_id(tax_id):
-    tax_id = str(tax_id or "").strip()
-    if not tax_id:
-        return "-"
-    if len(tax_id) <= 4:
-        return tax_id
-    return "*" * (len(tax_id) - 4) + tax_id[-4:]
-
-
-def _cef_pdf_sections(item, mask_tax_id):
-    client_name = f"{item.get('client_first_name', '')} {item.get('client_last_name', '')}".strip() or "-"
-    agent_name = f"{item.get('agent_first_name', '')} {item.get('agent_last_name', '')}".strip() or "-"
-
-    address_line1_parts = [p for p in [item.get("address_street"), item.get("address_street2")] if p]
-    address_line1 = ", ".join(address_line1_parts) if address_line1_parts else "-"
-    city_state_zip = ", ".join(p for p in [item.get("address_city"), item.get("address_state"), item.get("address_zip")] if p) or "-"
-
-    associated_yes = item.get("associated_person") == "other"
-    associated_text = "Yes" if associated_yes else "No"
-    if associated_yes and item.get("crd_number"):
-        associated_text += f" (CRD# {item['crd_number']})"
-
-    occupation = item.get("occupation") or "-"
-    if item.get("occupation") == "Other" and item.get("occupation_other"):
-        occupation = f"Other ({item['occupation_other']})"
-
-    employer_addr = ", ".join(
-        p for p in [item.get("employer_city"), item.get("employer_state"), item.get("employer_zip"), item.get("employer_country")] if p
-    ) or "-"
-
-    attestation = {
-        "agent": "Attested by Agent",
-        "client": "Attested by Client",
-    }.get(item.get("attestation"), "-")
-
-    top_row = [
-        ("Reference & Date", [
-            ("Reference", item.get("submission_id", "-")),
-            ("Date", item.get("created_at", "-")),
-        ]),
-        ("Referring Agent", [
-            ("Name", agent_name),
-            ("Email", item.get("agent_email") or "-"),
-        ]),
-    ]
-
-    stacked = [
-        ("Client", [
-            ("Name", client_name),
-            ("Email", item.get("client_email") or "-"),
-            ("Phone", item.get("client_phone") or "-"),
-            ("DOB", item.get("date_of_birth") or "-"),
-        ]),
-        ("Address", [
-            ("Street", address_line1),
-            ("City / State / Zip", city_state_zip),
-            ("Country", item.get("address_country") or "-"),
-        ]),
-        ("Identification", [
-            ("Tax ID / Gov't ID", _mask_tax_id(item.get("tax_id")) if mask_tax_id else (item.get("tax_id") or "-")),
-            ("Associated Person", associated_text),
-        ]),
-        ("Employment", [
-            ("Occupation", occupation),
-            ("Employer", item.get("employer_name") or "-"),
-            ("Employer Address", employer_addr),
-        ]),
-        ("Financial Profile", [
-            ("Net Worth", item.get("net_worth") or "-"),
-            ("Cumulative Investments", item.get("cumulative_investments") or "-"),
-            ("Annual Income", item.get("annual_income") or "-"),
-            ("Years Experience", item.get("years_experience") if item.get("years_experience") is not None else "-"),
-        ]),
-        ("Investment Profile", [
-            ("Objectives", _pdf_join(item.get("investment_objectives"), item.get("other_objective"))),
-            ("Previous Investment Types", _pdf_join(item.get("previous_investment_types"))),
-            ("Sophistication", _pdf_join(item.get("client_sophistication"), item.get("sophistication_other"))),
-        ]),
-        ("Suitability", [
-            ("Private equity/debt (past 5 yrs)", _pdf_yes_no(item.get("q_private_equity_five_years"))),
-            ("Can invest w/ limited liquidity need", _pdf_yes_no(item.get("q_illiquid_investments"))),
-            ("Risk tolerance for private securities", _pdf_yes_no(item.get("q_risk_tolerance"))),
-            ("Capable of independent judgement", _pdf_yes_no(item.get("q_independent_judgement"))),
-        ]),
-        ("Attestation", [
-            ("Attestation", attestation),
-        ]),
-    ]
-    return top_row, stacked
-
-
-def _draw_pdf_block(pdf, x, y, w, title, rows, font_size):
-    label_w = w * 0.40
-    value_w = w - label_w
-    pdf.set_xy(x, y)
-    pdf.set_font("helvetica", "B", font_size + 1)
-    pdf.set_text_color(*PDF_NAVY)
-    pdf.cell(w, font_size * 0.55, _pdf_text(title.upper()))
-    y += font_size * 0.62
-    pdf.set_draw_color(*PDF_GOLD)
-    pdf.set_line_width(0.2)
-    pdf.line(x, y, x + w, y)
-    y += font_size * 0.18
-    for label, value in rows:
-        pdf.set_xy(x, y)
-        pdf.set_font("helvetica", "B", font_size)
-        pdf.set_text_color(*PDF_GREY)
-        pdf.cell(label_w, font_size * 0.5, _pdf_text(label))
-        pdf.set_xy(x + label_w, y)
-        pdf.set_font("helvetica", "", font_size)
-        pdf.set_text_color(*PDF_NAVY)
-        pdf.multi_cell(value_w, font_size * 0.5, _pdf_text(value))
-        y = pdf.get_y() + font_size * 0.08
-    return y
-
-
-def _render_cef_pdf(item, mask_tax_id, font_size):
-    top_row, stacked = _cef_pdf_sections(item, mask_tax_id)
-
-    pdf = FPDF(format=PDF_PAGE_FORMAT, unit="mm")
-    pdf.set_auto_page_break(False)
-    pdf.set_margins(PDF_MARGIN_MM, PDF_MARGIN_MM, PDF_MARGIN_MM)
-    pdf.add_page()
-    page_w = pdf.w
-    page_h = pdf.h
-    content_w = page_w - 2 * PDF_MARGIN_MM
-
-    pdf.set_fill_color(*PDF_NAVY)
-    pdf.rect(0, 0, page_w, 24, style="F")
-    pdf.set_text_color(255, 255, 255)
-    pdf.set_font("helvetica", "B", 17)
-    pdf.set_xy(PDF_MARGIN_MM, 6)
-    pdf.cell(content_w, 8, _pdf_text("RAINMAKER SECURITIES"))
-    pdf.set_font("helvetica", "", 10)
-    pdf.set_xy(PDF_MARGIN_MM, 15)
-    pdf.cell(content_w, 6, _pdf_text("Client Engagement Form — Natural Person"))
-
-    pdf.set_fill_color(*PDF_GOLD)
-    pdf.rect(0, 24, page_w, 1.6, style="F")
-
-    y = 30
-    if item.get("eligibility_warning"):
-        pdf.set_xy(PDF_MARGIN_MM, y)
-        pdf.set_font("helvetica", "B", 10)
-        pdf.set_text_color(*PDF_RED)
-        pdf.cell(content_w, 6, _pdf_text("WARNING: May not be eligible for private secondary transactions."))
-        y += 7
-
-    col_w = (content_w - 6) / 2
-    y_left = _draw_pdf_block(pdf, PDF_MARGIN_MM, y, col_w, top_row[0][0], top_row[0][1], font_size)
-    y_right = _draw_pdf_block(pdf, PDF_MARGIN_MM + col_w + 6, y, col_w, top_row[1][0], top_row[1][1], font_size)
-    y = max(y_left, y_right) + 2
-
-    for title, rows in stacked:
-        y = _draw_pdf_block(pdf, PDF_MARGIN_MM, y, content_w, title, rows, font_size) + 2
-
-    fits = y <= (page_h - PDF_FOOTER_RESERVE_MM)
-
-    footer_y = page_h - PDF_FOOTER_RESERVE_MM + 4
-    pdf.set_draw_color(*PDF_GOLD)
-    pdf.set_line_width(0.4)
-    pdf.line(PDF_MARGIN_MM, footer_y, page_w - PDF_MARGIN_MM, footer_y)
-    pdf.set_xy(PDF_MARGIN_MM, footer_y + 2)
-    pdf.set_font("helvetica", "", 7.5)
-    pdf.set_text_color(*PDF_NAVY)
-    pdf.cell(content_w, 5, _pdf_text("Rainmaker Securities, LLC — Member FINRA/SIPC — Confidential"))
-
-    return pdf, fits
-
-
-def build_cef_pdf(item, mask_tax_id=False):
-    pdf = None
-    for font_size in (9, 8.5, 8, 7.5, 7):
-        pdf, fits = _render_cef_pdf(item, mask_tax_id, font_size)
-        if fits:
-            break
-    return bytes(pdf.output())
-
-
-def build_cef_pdf_filename(item, submission_id):
-    client_ref = item.get("client_last_name") or item.get("client_first_name") or "Client"
-    client_ref = re.sub(r"[^A-Za-z0-9_-]+", "", str(client_ref)) or "Client"
-    return f"CEF-{client_ref}-{str(submission_id)[:8]}.pdf"
-
-
-# ---------------------------------------------------------------------------
 # Submission emails (Part C): broker copy (masked) + RMS copy (full + ID)
 # ---------------------------------------------------------------------------
 
-def _fetch_id_document(s3_key):
+def _fetch_s3_bytes(s3_key):
     try:
         resp = s3.get_object(Bucket=BUCKET_NAME, Key=s3_key)
         return resp["Body"].read()
@@ -2716,18 +2700,26 @@ def _fetch_id_document(s3_key):
         return None
 
 
-def send_submission_emails(item, submission_id, host, broker_pdf=None):
+def pdf_attachment_filename(item, submission_id, variant):
+    client_ref = item.get("client_last_name") or item.get("client_first_name") or "Client"
+    client_ref = re.sub(r"[^A-Za-z0-9_-]+", "", str(client_ref)) or "Client"
+    return f"CEF-{client_ref}-{str(submission_id)[:8]}-{variant}.pdf"
+
+
+def send_submission_emails(item, submission_id, host):
     client_first = item.get("client_first_name", "")
     client_last = item.get("client_last_name", "")
     client_ref = client_last or client_first or "Client"
     agent_email = str(item.get("agent_email", "")).strip()
     admin_link = build_admin_link(submission_id, host)
 
-    # 1) Broker copy: only to a whitelisted RMS-domain agent, Tax ID masked,
-    #    no ID documents.
+    # 1) Broker copy: only to a whitelisted RMS-domain agent, Tax ID masked
+    #    (the browser generated it that way), no ID documents. The PDF is
+    #    fetched from S3 by the key handle_submit recorded on the item; if
+    #    the client never sent a valid PDF (or storing it failed), the
+    #    email still goes out with unchanged body text, just no attachment.
     if agent_email and agent_email.lower().endswith(AGENT_EMAIL_DOMAIN):
         try:
-            broker_pdf = broker_pdf if broker_pdf is not None else build_cef_pdf(item, mask_tax_id=True)
             msg = MIMEMultipart()
             msg["Subject"] = f"New Client Engagement Form: {client_first} {client_last}".strip()
             msg["From"] = SES_SENDER
@@ -2741,20 +2733,24 @@ def send_submission_emails(item, submission_id, host, broker_pdf=None):
                 f"{admin_link if admin_link else '(admin link unavailable)'}\n"
             )
             msg.attach(MIMEText(body_text, "plain"))
-            attachment = MIMEApplication(broker_pdf, _subtype="pdf")
-            attachment.add_header(
-                "Content-Disposition", "attachment", filename=build_cef_pdf_filename(item, submission_id)
-            )
-            msg.attach(attachment)
+            broker_pdf_key = item.get("pdf_broker_s3_key")
+            if broker_pdf_key:
+                broker_pdf_bytes = _fetch_s3_bytes(broker_pdf_key)
+                if broker_pdf_bytes:
+                    attachment = MIMEApplication(broker_pdf_bytes, _subtype="pdf")
+                    attachment.add_header(
+                        "Content-Disposition", "attachment",
+                        filename=pdf_attachment_filename(item, submission_id, "broker"),
+                    )
+                    msg.attach(attachment)
             ses.send_raw_email(RawMessage={"Data": msg.as_bytes()})
             print(f"route=submit status=broker_email_sent submission_id={submission_id}")
         except Exception:
             print(f"route=submit status=broker_email_failed submission_id={submission_id}")
 
-    # 2) RMS copy: always to RMS_TEAM_EMAIL, full (unmasked) PDF, plus any ID
-    #    document already uploaded to S3.
+    # 2) RMS copy: always to RMS_TEAM_EMAIL, full (unmasked) PDF fetched from
+    #    S3 (if one was stored), plus any ID document already uploaded.
     try:
-        rms_pdf = build_cef_pdf(item, mask_tax_id=False)
         msg = MIMEMultipart()
         msg["Subject"] = f"[RMS Copy] New Client Engagement Form: {client_first} {client_last}".strip()
         msg["From"] = SES_SENDER
@@ -2769,15 +2765,21 @@ def send_submission_emails(item, submission_id, host, broker_pdf=None):
             f"{admin_link if admin_link else '(admin link unavailable)'}\n"
         )
         msg.attach(MIMEText(body_text, "plain"))
-        attachment = MIMEApplication(rms_pdf, _subtype="pdf")
-        attachment.add_header(
-            "Content-Disposition", "attachment", filename=build_cef_pdf_filename(item, submission_id)
-        )
-        msg.attach(attachment)
+
+        rms_pdf_key = item.get("pdf_rms_s3_key")
+        if rms_pdf_key:
+            rms_pdf_bytes = _fetch_s3_bytes(rms_pdf_key)
+            if rms_pdf_bytes:
+                attachment = MIMEApplication(rms_pdf_bytes, _subtype="pdf")
+                attachment.add_header(
+                    "Content-Disposition", "attachment",
+                    filename=pdf_attachment_filename(item, submission_id, "rms"),
+                )
+                msg.attach(attachment)
 
         s3_key = item.get("id_upload_s3_key")
         if s3_key:
-            id_bytes = _fetch_id_document(s3_key)
+            id_bytes = _fetch_s3_bytes(s3_key)
             if id_bytes:
                 ext = str(s3_key).rsplit(".", 1)[-1].lower()
                 id_attachment = MIMEApplication(id_bytes, _subtype=ext or "octet-stream")
@@ -2985,6 +2987,35 @@ def handle_sweep():
 # Submit
 # ---------------------------------------------------------------------------
 
+def decode_valid_pdf(b64_value):
+    """Best-effort decode of a client-supplied base64 PDF: must actually be
+    base64, decode to <= PDF_MAX_BYTES, and start with the %PDF- magic
+    bytes. Returns the decoded bytes, or None if anything about it is
+    invalid -- the caller treats None as "no PDF" and never fails the
+    submission over it."""
+    if not b64_value or not isinstance(b64_value, str):
+        return None
+    try:
+        decoded = base64.b64decode(b64_value, validate=True)
+    except Exception:
+        return None
+    if not decoded or len(decoded) > PDF_MAX_BYTES:
+        return None
+    if not decoded.startswith(b"%PDF-"):
+        return None
+    return decoded
+
+
+def store_submission_pdf(submission_id, variant, pdf_bytes):
+    key = f"pdfs/{submission_id}-{variant}.pdf"
+    try:
+        s3.put_object(Bucket=BUCKET_NAME, Key=key, Body=pdf_bytes, ContentType="application/pdf")
+        return key
+    except ClientError:
+        print(f"route=submit status=pdf_s3_failed submission_id={submission_id} variant={variant}")
+        return None
+
+
 def handle_submit(body, ip, host):
     if str(body.get("website", "")).strip():
         print("route=submit status=honeypot")
@@ -3054,24 +3085,39 @@ def handle_submit(body, ip, host):
             500,
         )
 
-    broker_pdf_bytes = None
-    pdf_b64 = None
-    pdf_filename = None
-    try:
-        broker_pdf_bytes = build_cef_pdf(item, mask_tax_id=True)
-        pdf_b64 = base64.b64encode(broker_pdf_bytes).decode("ascii")
-        pdf_filename = build_cef_pdf_filename(item, submission_id)
-    except Exception:
-        print(f"route=submit status=pdf_failed submission_id={submission_id}")
+    # PDF handling comes strictly after the DynamoDB write above: the
+    # submission itself must never be lost over a PDF/S3/email problem.
+    # The client already generated both PDFs in the browser (jsPDF); this
+    # only validates and stores what it sent, never regenerates anything.
+    pdf_broker_bytes = decode_valid_pdf(body.get("pdf_broker_b64"))
+    pdf_rms_bytes = decode_valid_pdf(body.get("pdf_rms_b64"))
 
-    send_submission_emails(item, submission_id, host, broker_pdf=broker_pdf_bytes)
+    pdf_keys = {}
+    if pdf_broker_bytes:
+        key = store_submission_pdf(submission_id, "broker", pdf_broker_bytes)
+        if key:
+            pdf_keys["pdf_broker_s3_key"] = key
+    if pdf_rms_bytes:
+        key = store_submission_pdf(submission_id, "rms", pdf_rms_bytes)
+        if key:
+            pdf_keys["pdf_rms_s3_key"] = key
+
+    if pdf_keys:
+        try:
+            table.update_item(
+                Key={"submission_id": submission_id},
+                UpdateExpression="SET " + ", ".join(f"#{k} = :{k}" for k in pdf_keys),
+                ExpressionAttributeNames={f"#{k}": k for k in pdf_keys},
+                ExpressionAttributeValues={f":{k}": v for k, v in pdf_keys.items()},
+            )
+            item.update(pdf_keys)
+        except ClientError:
+            print(f"route=submit status=pdf_keys_save_failed submission_id={submission_id}")
+
+    send_submission_emails(item, submission_id, host)
 
     print(f"route=submit status=200 submission_id={submission_id}")
-    response_data = {"ok": True, "submission_id": submission_id}
-    if pdf_b64:
-        response_data["pdf_b64"] = pdf_b64
-        response_data["pdf_filename"] = pdf_filename
-    return response_json(response_data)
+    return response_json({"ok": True, "submission_id": submission_id})
 
 
 # ---------------------------------------------------------------------------
@@ -3161,7 +3207,10 @@ def render_admin_detail(submission_id, admin_key):
             f"<div class='detail-value'>{html.escape(value_str)}</div></div>"
         )
     for key, value in item.items():
-        if key in seen or key in ("id_upload_s3_key", "id_upload_status", "eligibility_warning"):
+        if key in seen or key in (
+            "id_upload_s3_key", "id_upload_status", "eligibility_warning",
+            "pdf_broker_s3_key", "pdf_rms_s3_key",
+        ):
             continue
         label = FIELD_LABELS.get(key, key.replace("_", " ").title())
         rows_html.append(
@@ -3194,17 +3243,22 @@ def render_admin_detail(submission_id, admin_key):
         warning_html = f"<div class='eligibility-warning'>&#9888; {html.escape(ELIGIBILITY_WARNING_TEXT)}</div>"
 
     back_url = f"/?view=admin&key={quote(admin_key)}"
-    pdf_links_html = ""
-    if item.get("status") == SUBMISSION_STATUS_COMPLETE:
-        broker_pdf_url = f"/?view=pdf&key={quote(admin_key)}&id={quote(submission_id)}&variant=broker"
-        rms_pdf_url = f"/?view=pdf&key={quote(admin_key)}&id={quote(submission_id)}&variant=rms"
-        pdf_links_html = (
-            "<p>"
-            f"<a class='detail-link' href='{html.escape(broker_pdf_url)}'>Download PDF (Broker copy)</a>"
-            " &nbsp;|&nbsp; "
-            f"<a class='detail-link' href='{html.escape(rms_pdf_url)}'>Download PDF (RMS copy)</a>"
-            "</p>"
-        )
+    pdf_link_parts = []
+    for pdf_key_field, label in (
+        ("pdf_broker_s3_key", "Download PDF (Broker copy)"),
+        ("pdf_rms_s3_key", "Download PDF (RMS copy)"),
+    ):
+        pdf_s3_key = item.get(pdf_key_field)
+        if not pdf_s3_key:
+            continue
+        try:
+            pdf_url = s3.generate_presigned_url(
+                "get_object", Params={"Bucket": BUCKET_NAME, "Key": pdf_s3_key}, ExpiresIn=900
+            )
+            pdf_link_parts.append(f"<a class='detail-link' href='{html.escape(pdf_url)}'>{label}</a>")
+        except ClientError:
+            pass
+    pdf_links_html = f"<p>{' &nbsp;|&nbsp; '.join(pdf_link_parts)}</p>" if pdf_link_parts else ""
     content = (
         f"<p><a class='detail-link' href='{html.escape(back_url)}'>&larr; Back to submissions</a></p>"
         "<h1>Submission Detail</h1>"
@@ -3231,38 +3285,6 @@ def handle_admin(params, host):
     return render_admin_list(supplied_key)
 
 
-def handle_admin_pdf(params, host):
-    admin_key = os.environ.get("ADMIN_KEY", "")
-    supplied_key = params.get("key", "")
-    if not admin_key or supplied_key != admin_key:
-        print("route=admin_pdf status=403")
-        return response_text("Forbidden", 403)
-
-    submission_id = params.get("id")
-    variant = params.get("variant")
-    if variant not in ("broker", "rms"):
-        print("route=admin_pdf status=400")
-        return response_text("Invalid variant", 400)
-
-    try:
-        resp = table.get_item(Key={"submission_id": submission_id})
-    except ClientError:
-        resp = {}
-    item = resp.get("Item")
-    if not item or item.get("form_type") != FORM_TYPE_CEF_NATURAL:
-        print("route=admin_pdf status=404")
-        return response_text("Not Found", 404)
-
-    if item.get("status") != SUBMISSION_STATUS_COMPLETE:
-        print(f"route=admin_pdf status=400 submission_id={submission_id}")
-        return response_text("Record incomplete", 400)
-
-    pdf_bytes = build_cef_pdf(item, mask_tax_id=(variant == "broker"))
-    filename = build_cef_pdf_filename(item, submission_id)
-    print(f"route=admin_pdf status=200 submission_id={submission_id}")
-    return response_pdf(pdf_bytes, filename)
-
-
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
@@ -3282,8 +3304,6 @@ def lambda_handler(event, context):
         if method == "GET":
             if params.get("view") == "admin":
                 return handle_admin(params, host)
-            if params.get("view") == "pdf":
-                return handle_admin_pdf(params, host)
             print("route=form status=200")
             if params.get("notes") == "glen":
                 return response_html(FORM_HTML_WITH_GLEN_NOTES)
