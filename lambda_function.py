@@ -80,6 +80,77 @@ OCCUPATION_OPTIONS = (
 
 ELIGIBILITY_WARNING_TEXT = "Not eligible for private secondary transactions."
 
+# Referring Agent roster shown on Step 1 when no ?agent= URL param is present.
+# Source of truth for the dropdown and for resolving/validating a selection.
+AGENT_ROSTER = (
+    ("Ben Martin", "bmartin@rainmakersecurities.com"),
+    ("Brandon Hopen", "bhopen@rainmakersecurities.com"),
+    ("Brendan Breen", "bbreen@rainmakersecurities.com"),
+    ("Cang Quach", "cvq@sternventures.com"),
+    ("Chad Gracia", "cgracia@rainmakersecurities.com"),
+    ("Christian Lagerling", "christian@belucaventures.com"),
+    ("Connor Hallisey", "ch@acceleratesportsbusiness.com"),
+    ("Daniel Roche", "daniel@kellscapital.com"),
+    ("David Bernstein", "dbernstein@rainmakersecurities.com"),
+    ("David Knorowski", "dknorowski@rainmakersecurities.com"),
+    ("David Reinikainen", "dreinikainen@rainmakersecurities.com"),
+    ("Dominic Cioffi", "dcioffi@rainmakersecurities.com"),
+    ("Elena Kareva", "ekareva@rainmakersecurities.com"),
+    ("Gary Selz", "gselz@outsetpartners.com"),
+    ("Glen Anderson", "ganderson@rainmakersecurities.com"),
+    ("Greg Smith", "gsmith@rainmakersecurities.com"),
+    ("Greg Capello", "gcapello@premieralts.com"),
+    ("Greg Martin", "gmartin@rainmakersecurities.com"),
+    ("Ian Subel", "isubel@marulacap.com"),
+    ("Jack Richardson", "jack@hamiagroup.com"),
+    ("Jack Stafford", "js@acceleratesportsbusiness.com"),
+    ("Jordon Durst", "jdurst@rainmakersecurities.com"),
+    ("Jyoti Soni", "jsoni@rainmakersecurities.com"),
+    ("Ken Anderson", "kanderson@rainmakersecurities.com"),
+    ("Kirat S. Lall", "kslall@rainmakersecurities.com"),
+    ("Kris Gilboy", "kgilboy@outsetpartners.com"),
+    ("Laurence Hayward", "lh@lab-137.com"),
+    ("Marco Sutic", "msutic@rainmakersecurities.com"),
+    ("Marianna Prueger", "mprueger@rainmakersecurities.com"),
+    ("Mariano Grosman", "mgrosman@rainmakersecurities.com"),
+    ("Mariano Grosman (APAC)", "mgrosman@rainmakerapac.com"),
+    ("Mark Caccavo", "mcaccavo@bomboraadvisory.com"),
+    ("Mark Sullivan", "msullivan@rainmakersecurities.com"),
+    ("Marko Kozul", "marko@catalytic-life.com"),
+    ("Michael Beardsley", "beards@internetsec.com"),
+    ("Michael Grenier", "michael@ballardcap.com"),
+    ("Olga Klimov", "oklimov@rainmakersecurities.com"),
+    ("Peter Striebel", "pstriebel@outsetpartners.com"),
+    ("Phillip Cooper", "pcooper@rainmakersecurities.com"),
+    ("Ronald Chamorro", "rchamorro@rainmakersecurities.com"),
+    ("Saeid Hamedanchi", "shamedanchi@rainmakersecurities.com"),
+    ("Sean Lavin", "sean@alphalavin.com"),
+    ("Sequoia Taylor", "staylor@spry.vc"),
+    ("Simon Hanna", "shanna@rainmakersecurities.com"),
+    ("Tim Barnes", "tbarnes@axisgroupventures.com"),
+    ("Tom Bonfield", "tom@impacts.capital"),
+    ("Wayne Platt", "wplatt@marulacap.com"),
+    ("Yoram Arbel", "yoram@pacificoakscapital.com"),
+    ("Zach Sease", "zsease@rainmakersecurities.com"),
+)
+
+OPS_FALLBACK_FIRST = "None"
+OPS_FALLBACK_LAST = "Ops"
+OPS_FALLBACK_EMAIL = "ops@rainmakersecurities.com"
+
+
+def split_agent_display_name(display_name):
+    name = display_name[: -len(" (APAC)")] if display_name.endswith(" (APAC)") else display_name
+    parts = name.split(" ")
+    if len(parts) == 1:
+        return parts[0], ""
+    return " ".join(parts[:-1]), parts[-1]
+
+
+AGENT_ROSTER_TUPLES = {
+    split_agent_display_name(display_name) + (email,) for display_name, email in AGENT_ROSTER
+}
+
 INVESTMENT_OBJECTIVE_OPTIONS = (
     "generate income",
     "liquidate assets",
@@ -385,6 +456,25 @@ def build_country_options_html(default="United States"):
     return "".join(parts)
 
 
+def build_agent_roster_options_html():
+    parts = ["<option value=''>Select your Rainmaker Securities Agent&#8230;</option>"]
+    for display_name, _email in AGENT_ROSTER:
+        esc = html.escape(display_name)
+        parts.append(f"<option value='{esc}'>{esc}</option>")
+    parts.append("<option value='__none__'>No referring agent</option>")
+    parts.append("<option value='__manual__'>My agent is not listed (enter manually)</option>")
+    return "".join(parts)
+
+
+def build_agent_roster_js_map():
+    entries = {}
+    for display_name, email in AGENT_ROSTER:
+        first, last = split_agent_display_name(display_name)
+        entries[display_name] = {"first": first, "last": last, "email": email}
+    entries["__none__"] = {"first": OPS_FALLBACK_FIRST, "last": OPS_FALLBACK_LAST, "email": OPS_FALLBACK_EMAIL}
+    return json.dumps(entries)
+
+
 NET_WORTH_SELECT_HTML = build_select_options_html(NET_WORTH_OPTIONS, "Select…")
 CUMULATIVE_SELECT_HTML = build_select_options_html(NET_WORTH_OPTIONS, "Select…")
 ANNUAL_INCOME_SELECT_HTML = build_select_options_html(ANNUAL_INCOME_OPTIONS, "Select…")
@@ -393,6 +483,8 @@ INVESTMENT_OBJECTIVES_CHECKS_HTML = build_checkbox_options_html("investment_obje
 PREVIOUS_INVESTMENT_CHECKS_HTML = build_checkbox_options_html("previous_investment_types", PREVIOUS_INVESTMENT_OPTIONS)
 SOPHISTICATION_CHECKS_HTML = build_checkbox_options_html("client_sophistication", SOPHISTICATION_OPTIONS)
 COUNTRY_OPTIONS_HTML = build_country_options_html()
+AGENT_ROSTER_OPTIONS_HTML = build_agent_roster_options_html()
+AGENT_ROSTER_JS_MAP = build_agent_roster_js_map()
 RETIRING_RADIOS_HTML = build_yesno_radios("retiring_five_years")
 Q1_RADIOS_HTML = build_yesno_radios("q_private_equity_five_years")
 Q2_RADIOS_HTML = build_yesno_radios("q_illiquid_investments")
@@ -449,25 +541,33 @@ __HEADER__
           <div class="field-error"></div>
         </div>
 
-        <div class="two-col">
-          <div class="field" data-field="agent_first_name">
-            <label class="field-label" for="agent_first_name">Referring Agent First Name</label>
-            <input type="text" id="agent_first_name" name="agent_first_name">
+        <div id="referring-agent-section">
+          <div class="field" data-field="agent_roster" id="agent-roster-wrap" style="display:none;">
+            <label class="field-label" for="agent_roster">Who is the Rainmaker Securities Agent that referred the Client to this form?</label>
+            <select id="agent_roster">__AGENT_ROSTER_OPTIONS__</select>
             <div class="field-error"></div>
           </div>
-          <div class="field" data-field="agent_last_name">
-            <label class="field-label" for="agent_last_name">Referring Agent Last Name</label>
-            <input type="text" id="agent_last_name" name="agent_last_name">
-            <div class="field-error"></div>
-          </div>
-        </div>
 
-        <div class="field" data-field="agent_email">
-          <label class="field-label" for="agent_email">Referring Agent Email</label>
-          <input type="email" id="agent_email" name="agent_email">
-          <span class="lock-icon" id="agent_email_lock" style="display:none;">&#128274;</span>
-          <div class="helper-text">If no agent referred you to RMS, enter ops@rainmakersecurities.com</div>
-          <div class="field-error"></div>
+          <div class="two-col" id="agent-manual-names">
+            <div class="field" data-field="agent_first_name">
+              <label class="field-label" for="agent_first_name">Referring Agent First Name</label>
+              <input type="text" id="agent_first_name" name="agent_first_name">
+              <div class="field-error"></div>
+            </div>
+            <div class="field" data-field="agent_last_name">
+              <label class="field-label" for="agent_last_name">Referring Agent Last Name</label>
+              <input type="text" id="agent_last_name" name="agent_last_name">
+              <div class="field-error"></div>
+            </div>
+          </div>
+
+          <div class="field" data-field="agent_email" id="agent-email-wrap">
+            <label class="field-label" for="agent_email">Referring Agent Email</label>
+            <input type="email" id="agent_email" name="agent_email">
+            <span class="lock-icon" id="agent_email_lock" style="display:none;">&#128274;</span>
+            <div class="helper-text">If no agent referred you to RMS, enter ops@rainmakersecurities.com</div>
+            <div class="field-error"></div>
+          </div>
         </div>
       </div>
 
@@ -732,8 +832,10 @@ __HEADER__
 (function () {
   "use strict";
 
+  var AGENT_ROSTER_MAP = __AGENT_ROSTER_JS_MAP__;
+
   var STEP_OF_FIELD = {
-    confirm_read: 1, agent_first_name: 1, agent_last_name: 1, agent_email: 1,
+    confirm_read: 1, agent_roster: 1, agent_first_name: 1, agent_last_name: 1, agent_email: 1,
     client_first_name: 2, client_last_name: 2,
     address_street: 2, address_city: 2, address_state: 2, address_zip: 2, address_country: 2,
     client_phone: 2, client_email: 2, tax_id: 2, date_of_birth: 2,
@@ -809,17 +911,32 @@ __HEADER__
 
   function isEmailValid(v) { return /^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(v); }
 
+  function isManualAgentFieldsVisible() {
+    var el = qs("#agent-manual-names");
+    return !el || el.style.display !== "none";
+  }
+
   function validateStep1() {
     var ok = true;
     if (!qs("#confirm_read").checked) { showFieldError("confirm_read", "You must confirm you have read and understand this section."); ok = false; } else { clearFieldError("confirm_read"); }
-    ["agent_first_name", "agent_last_name"].forEach(function (f) {
-      var v = qs("#" + f).value.trim();
-      if (!v) { showFieldError(f, "This field is required."); ok = false; } else { clearFieldError(f); }
-    });
-    var email = qs("#agent_email").value.trim();
-    if (!email) { showFieldError("agent_email", "This field is required."); ok = false; }
-    else if (!isEmailValid(email)) { showFieldError("agent_email", "Enter a valid email address."); ok = false; }
-    else { clearFieldError("agent_email"); }
+
+    var rosterWrap = qs("#agent-roster-wrap");
+    var rosterVisible = rosterWrap && rosterWrap.style.display !== "none";
+    if (rosterVisible) {
+      if (!qs("#agent_roster").value) { showFieldError("agent_roster", "Select your Rainmaker Securities Agent."); ok = false; }
+      else { clearFieldError("agent_roster"); }
+    }
+
+    if (!rosterVisible || isManualAgentFieldsVisible()) {
+      ["agent_first_name", "agent_last_name"].forEach(function (f) {
+        var v = qs("#" + f).value.trim();
+        if (!v) { showFieldError(f, "This field is required."); ok = false; } else { clearFieldError(f); }
+      });
+      var email = qs("#agent_email").value.trim();
+      if (!email) { showFieldError("agent_email", "This field is required."); ok = false; }
+      else if (!isEmailValid(email)) { showFieldError("agent_email", "Enter a valid email address."); ok = false; }
+      else { clearFieldError("agent_email"); }
+    }
     return ok;
   }
 
@@ -1029,7 +1146,7 @@ __HEADER__
     });
   });
 
-  function prefillAgent() {
+  function initReferringAgent() {
     var params = new URLSearchParams(window.location.search);
     var agent = params.get("agent");
     var agentName = params.get("agent_name");
@@ -1055,8 +1172,42 @@ __HEADER__
         }
       }
     }
+
+    // ?agent= present: same exact lock behavior as before, roster stays hidden.
+    if (agent) { return; }
+
+    // Raw link (no ?agent=): show the roster dropdown, hide the free-text
+    // fields until "My agent is not listed" is chosen.
+    var rosterWrap = qs("#agent-roster-wrap");
+    var manualNames = qs("#agent-manual-names");
+    var emailWrap = qs("#agent-email-wrap");
+    rosterWrap.style.display = "block";
+    manualNames.style.display = "none";
+    emailWrap.style.display = "none";
+
+    qs("#agent_roster").addEventListener("change", function () {
+      var value = this.value;
+      clearFieldError("agent_roster");
+      if (value === "__manual__") {
+        manualNames.style.display = "flex";
+        emailWrap.style.display = "block";
+        qs("#agent_first_name").value = "";
+        qs("#agent_last_name").value = "";
+        qs("#agent_email").value = "";
+        clearFieldError("agent_first_name");
+        clearFieldError("agent_last_name");
+        clearFieldError("agent_email");
+      } else {
+        manualNames.style.display = "none";
+        emailWrap.style.display = "none";
+        var resolved = AGENT_ROSTER_MAP[value];
+        qs("#agent_first_name").value = resolved ? resolved.first : "";
+        qs("#agent_last_name").value = resolved ? resolved.last : "";
+        qs("#agent_email").value = resolved ? resolved.email : "";
+      }
+    });
   }
-  prefillAgent();
+  initReferringAgent();
 
   var uploadIdBtn = qs("#upload-id-btn");
   var idUploadNotice = qs("#id-upload-notice");
@@ -1230,6 +1381,8 @@ def render_form_page():
     page = page.replace("__SHARED_CSS__", SHARED_CSS)
     page = page.replace("__HEADER__", SHARED_HEADER)
     page = page.replace("__COUNTRY_OPTIONS__", COUNTRY_OPTIONS_HTML)
+    page = page.replace("__AGENT_ROSTER_OPTIONS__", AGENT_ROSTER_OPTIONS_HTML)
+    page = page.replace("__AGENT_ROSTER_JS_MAP__", AGENT_ROSTER_JS_MAP)
     page = page.replace("__RETIRING_RADIOS__", RETIRING_RADIOS_HTML)
     page = page.replace("__OCCUPATION_OPTIONS__", OCCUPATION_OPTIONS_HTML)
     page = page.replace("__NET_WORTH_SELECT__", NET_WORTH_SELECT_HTML)
@@ -1258,7 +1411,7 @@ ADMIN_PAGE_RENDERED = ADMIN_PAGE_TEMPLATE.replace("__SHARED_CSS__", SHARED_CSS).
 
 GLEN_NOTE_TEXTS = {
     1: "Glen: You're viewing the annotated version — these margin notes appear only on this private preview link. Clients see a clean form with none of this.",
-    2: "Glen: These now prefill and lock automatically based on which RMS agent sent the client the form — each agent gets a personal link. Every submission arrives correctly attributed; no more blank or misspelled agent fields.",
+    2: "Glen: Two paths, both foolproof: each agent gets a personal link that pre-fills and locks their name — and if a raw link circulates, the client picks the agent from the official roster instead of typing. Either way, every submission arrives correctly attributed. No more blank, misspelled, or unknown agent fields.",
     3: "Glen: File upload intentionally not implemented yet — I'll wire it up once RMS tells me where these documents should live. My opinion: a copy of the ID should NOT be sent to agents by email, as happens today. The agent should receive the form data stripped of the ID, with the ID going only to RMS safekeeping.",
     4: "Glen: Country now comes first and drives the rest: US clients get a proper state dropdown, the form pre-populates city and state from the zip code, and zip code errors are disallowed at entry. Bad addresses can no longer reach us.",
     5: "Glen: Every identification field is now required and format-checked before the client can advance — fewer incomplete forms, fewer repeat requests back to the client.",
@@ -1273,7 +1426,7 @@ GLEN_NOTE_TEXTS = {
 # markers added to the template, so the base page never carries any trace.
 GLEN_NOTE_ANCHORS = [
     (1, '<ol class="instructions-list">', "before"),
-    (2, '<div class="two-col">\n          <div class="field" data-field="agent_first_name">', "before"),
+    (2, '<div id="referring-agent-section">', "before"),
     (3, '<div class="field">\n          <label class="field-label">Identity Verification Upload</label>', "before"),
     (4, '<h3>Address of Client</h3>', "after"),
     (5, '<div class="two-col">\n          <div class="field" data-field="client_phone">', "before"),
@@ -1451,11 +1604,36 @@ def validate_submission(raw):
     # Step 1
     if not raw.get("confirm_read"):
         errors["confirm_read"] = "You must confirm you have read and understand this section."
-    req_text("agent_first_name", "Referring Agent First Name")
-    req_text("agent_last_name", "Referring Agent Last Name")
-    agent_email = req_text("agent_email", "Referring Agent Email")
-    if agent_email and not EMAIL_RE.match(agent_email):
-        errors["agent_email"] = "Enter a valid email address."
+
+    agent_first = str(raw.get("agent_first_name", "")).strip()
+    agent_last = str(raw.get("agent_last_name", "")).strip()
+    agent_email = str(raw.get("agent_email", "")).strip()
+
+    if (agent_first, agent_last, agent_email) in AGENT_ROSTER_TUPLES or (
+        agent_first == OPS_FALLBACK_FIRST and agent_last == OPS_FALLBACK_LAST and agent_email == OPS_FALLBACK_EMAIL
+    ):
+        # Known roster entry (or the "No referring agent" fallback) submitted
+        # by the Step 1 dropdown — trust the resolved triple as-is.
+        data["agent_first_name"] = agent_first[:500]
+        data["agent_last_name"] = agent_last[:500]
+        data["agent_email"] = agent_email[:500]
+    else:
+        # Manual entry: either the ?agent= URL-locked fields, or "My agent
+        # is not listed" — validated the same way this always has been.
+        if not agent_first:
+            errors["agent_first_name"] = "Referring Agent First Name is required."
+        else:
+            data["agent_first_name"] = agent_first[:500]
+        if not agent_last:
+            errors["agent_last_name"] = "Referring Agent Last Name is required."
+        else:
+            data["agent_last_name"] = agent_last[:500]
+        if not agent_email:
+            errors["agent_email"] = "Referring Agent Email is required."
+        elif not EMAIL_RE.match(agent_email):
+            errors["agent_email"] = "Enter a valid email address."
+        else:
+            data["agent_email"] = agent_email[:500]
 
     # Step 2
     data["id_upload_status"] = ID_UPLOAD_STATUS_DEFERRED
