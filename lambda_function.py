@@ -581,7 +581,7 @@ __HEADER__
           <button type="button" class="btn" id="upload-id-btn">Upload ID Document</button>
           <div class="id-upload-notice" id="id-upload-notice">
             <span class="id-upload-notice-icon">&#128274;</span>
-            <span>Identity documents will be directly encrypted and transferred to RMS safekeeping only.</span>
+            <span><strong>Identity verification is required by federal law.</strong> Under the USA PATRIOT Act and U.S. Treasury regulations (31 CFR &sect;1023.220), Rainmaker Securities must verify each client's identity against a government-issued photo ID before any transaction. Your document is encrypted in your browser before it leaves this page and can be opened only by Rainmaker Securities compliance. It is stored with AES-256 encryption in accordance with SEC Regulation S-P (the Safeguards Rule), and it is never sent by email &mdash; not to your referring agent, not to anyone.</span>
           </div>
         </div>
 
@@ -1412,7 +1412,7 @@ ADMIN_PAGE_RENDERED = ADMIN_PAGE_TEMPLATE.replace("__SHARED_CSS__", SHARED_CSS).
 GLEN_NOTE_TEXTS = {
     1: "Glen: You're viewing the annotated version — these margin notes appear only on this private preview link. Clients see a clean form with none of this.",
     2: "Glen: Two paths, both foolproof: each agent gets a personal link that pre-fills and locks their name — and if a raw link circulates, the client picks the agent from the official roster instead of typing. Either way, every submission arrives correctly attributed. No more blank, misspelled, or unknown agent fields.",
-    3: "Glen: File upload intentionally not implemented yet — I'll wire it up once RMS tells me where these documents should live. My opinion: a copy of the ID should NOT be sent to agents by email, as happens today. The agent should receive the form data stripped of the ID, with the ID going only to RMS safekeeping.",
+    3: "Glen: The text at left describes the end state; the upload itself is switched off until RMS confirms where these documents should live. The design is worth the wait: the ID gets encrypted in the client's browser with an RMS-held key, so it lands in storage as ciphertext that only RMS compliance can open — I can't see it, and no other agent can either. My recommendation: we stop emailing ID copies to referring brokers entirely, as happens today. The broker receives the engagement form data; the ID goes to RMS only. Fewer copies of passports sitting in fewer inboxes.",
     4: "Glen: Country now comes first and drives the rest: US clients get a proper state dropdown, the form pre-populates city and state from the zip code, and zip code errors are disallowed at entry. Bad addresses can no longer reach us.",
     5: "Glen: Every identification field is now required and format-checked before the client can advance — fewer incomplete forms, fewer repeat requests back to the client.",
     6: "Glen: Occupation is now a standardized dropdown with an Other option. Today we get free text — real examples from our files: 'VC', 'Real Estate', 'N/A' — which makes the data inconsistent and hard to use.",
