@@ -1263,6 +1263,9 @@ __HEADER__
   var PDF_MARGIN = 40;
   var PDF_HEADER_H = 68;
   var PDF_FOOTER_RESERVE = 50;
+  var PDF_MIN_FONT = 7;
+  var PDF_MONTHS = ["January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"];
 
   function pdfJoinList(values, extra) {
     var text = (Array.isArray(values) && values.length) ? values.join(", ") : "-";
@@ -1286,6 +1289,149 @@ __HEADER__
     return btoa(binary);
   }
 
+  function sanitizeFilenamePart(s) {
+    // Strips filesystem-unsafe characters by char code (forward slash,
+    // backslash, colon, asterisk, question mark, double quote, angle
+    // brackets, pipe) rather than a regex literal, since embedding a
+    // literal backslash in a Python-templated JS string is error-prone.
+    var badCodes = [47, 92, 58, 42, 63, 34, 60, 62, 124];
+    var str = String(s || "");
+    var out = "";
+    for (var i = 0; i < str.length; i++) {
+      if (badCodes.indexOf(str.charCodeAt(i)) === -1) { out += str.charAt(i); }
+    }
+    return out.trim();
+  }
+
+  function formatPdfDate(isoStr) {
+    var d = new Date(isoStr);
+    if (!isoStr || isNaN(d.getTime())) { return String(isoStr || "-"); }
+    var hh = ("0" + d.getUTCHours()).slice(-2);
+    var mm = ("0" + d.getUTCMinutes()).slice(-2);
+    return PDF_MONTHS[d.getUTCMonth()] + " " + d.getUTCDate() + ", " + d.getUTCFullYear() +
+      " — " + hh + ":" + mm + " UTC";
+  }
+
+  function formatPdfDob(dateStr) {
+    if (!dateStr) { return "-"; }
+    var d = new Date(dateStr);
+    if (isNaN(d.getTime())) { return String(dateStr); }
+    return PDF_MONTHS[d.getUTCMonth()] + " " + d.getUTCDate() + ", " + d.getUTCFullYear();
+  }
+
+  function formatPdfPhone(phone) {
+    var raw = String(phone || "").trim();
+    if (!raw) { return "-"; }
+    var digits = raw.replace(/\D/g, "");
+    if (digits.length === 11 && digits.charAt(0) === "1") { digits = digits.slice(1); }
+    if (digits.length === 10) {
+      return "(" + digits.slice(0, 3) + ") " + digits.slice(3, 6) + "-" + digits.slice(6);
+    }
+    return raw;
+  }
+
+  function omitEmptyRows(rows) {
+    return rows.filter(function (row) { return row[1] !== "-"; });
+  }
+
+  // Splits a value at natural break characters (@ . -), keeping each break
+  // character attached to the end of the chunk before it, so a long email
+  // or reference never gets cut mid-word. Only used as a last resort, when
+  // the value still doesn't fit even at PDF_MIN_FONT.
+  function splitAtNaturalBreaks(str) {
+    var tokens = [];
+    var current = "";
+    for (var i = 0; i < str.length; i++) {
+      current += str.charAt(i);
+      if (str.charAt(i) === "@" || str.charAt(i) === "." || str.charAt(i) === "-") {
+        tokens.push(current);
+        current = "";
+      }
+    }
+    if (current) { tokens.push(current); }
+    return tokens;
+  }
+
+  function wrapAtNaturalBreaks(doc, value, maxWidth, fontSize) {
+    doc.setFontSize(fontSize);
+    var tokens = splitAtNaturalBreaks(String(value));
+    var lines = [];
+    var current = "";
+    tokens.forEach(function (tok) {
+      var candidate = current + tok;
+      if (current && doc.getTextWidth(candidate) > maxWidth) {
+        lines.push(current);
+        current = tok;
+      } else {
+        current = candidate;
+      }
+    });
+    if (current) { lines.push(current); }
+    // A single token can still overflow (e.g. a long unbroken domain) --
+    // hard-wrap it character by character as the very last resort.
+    var finalLines = [];
+    lines.forEach(function (line) {
+      if (doc.getTextWidth(line) <= maxWidth) { finalLines.push(line); return; }
+      var chunk = "";
+      for (var i = 0; i < line.length; i++) {
+        var next = chunk + line.charAt(i);
+        if (chunk && doc.getTextWidth(next) > maxWidth) {
+          finalLines.push(chunk);
+          chunk = line.charAt(i);
+        } else {
+          chunk = next;
+        }
+      }
+      if (chunk) { finalLines.push(chunk); }
+    });
+    return finalLines;
+  }
+
+  // jsPDF's own splitTextToSize force-wraps an overlong unspaced run (an
+  // email, a reference code) at arbitrary character boundaries so the
+  // *result* always fits maxWidth -- checking the wrapped lines' widths
+  // afterward can never detect that. So instead check up front whether any
+  // individual word (space-separated token) is too wide to fit on its own
+  // line at this font size; only that condition means normal word-wrap
+  // would have to cut a word apart.
+  function longestWordWidth(doc, str, fontSize) {
+    doc.setFontSize(fontSize);
+    var words = String(str).split(" ");
+    var max = 0;
+    words.forEach(function (w) {
+      var width = doc.getTextWidth(w);
+      if (width > max) { max = width; }
+    });
+    return max;
+  }
+
+  // Renders `value` to fit maxWidth without ever breaking mid-word: tries
+  // the base font size first (normal space-wrapping), then shrinks down to
+  // PDF_MIN_FONT if any word is still too wide, then falls back to
+  // wrapping at natural break characters (@ . -) if it's still too wide.
+  function fitPdfValueLines(doc, value, maxWidth, baseFontSize) {
+    var str = String(value);
+    doc.setFont("helvetica", "normal");
+
+    var fontSize = baseFontSize;
+    if (longestWordWidth(doc, str, fontSize) > maxWidth) {
+      fontSize = Math.min(PDF_MIN_FONT, baseFontSize);
+    }
+
+    if (longestWordWidth(doc, str, fontSize) > maxWidth) {
+      // Even at the smallest font, at least one unbroken run of characters
+      // still doesn't fit -- only now is it safe to break it, and only at
+      // natural break characters (@ . -), never mid-word.
+      var brokenLines = wrapAtNaturalBreaks(doc, str, maxWidth, fontSize);
+      return { lines: brokenLines, fontSize: fontSize };
+    }
+
+    doc.setFontSize(fontSize);
+    var lines = doc.splitTextToSize(str, maxWidth);
+    lines = Array.isArray(lines) ? lines : [lines];
+    return { lines: lines, fontSize: fontSize };
+  }
+
   function buildCefPdfSections(data, submissionId, createdAtStr, maskTax) {
     var clientName = ((data.client_first_name || "") + " " + (data.client_last_name || "")).trim() || "-";
     var agentName = ((data.agent_first_name || "") + " " + (data.agent_last_name || "")).trim() || "-";
@@ -1307,59 +1453,73 @@ __HEADER__
       : "-";
 
     var attestationText = { agent: "Attested by Agent", client: "Attested by Client" }[data.attestation] || "-";
+    var refShort = submissionId ? String(submissionId).slice(0, 8) : "-";
+
+    // Employment gets its own layout, not the generic omit-if-empty rule:
+    // no employer collapses to a single "Employer: None" line, dropping
+    // the Employer Address row entirely and the Occupation row unless it
+    // actually has a value.
+    var employmentRows;
+    if (hasEmployer) {
+      employmentRows = omitEmptyRows([
+        ["Occupation", occupation],
+        ["Employer", data.employer_name],
+        ["Employer Address", employerAddr]
+      ]);
+    } else {
+      employmentRows = [];
+      if (occupation !== "-") { employmentRows.push(["Occupation", occupation]); }
+      employmentRows.push(["Employer", "None"]);
+    }
 
     var topRow = [
-      ["Reference & Date", [
-        ["Reference", submissionId || "-"],
-        ["Date", createdAtStr || "-"]
-      ]],
-      ["Referring Agent", [
+      ["Reference & Date", omitEmptyRows([
+        ["Reference", refShort],
+        ["Date", formatPdfDate(createdAtStr)]
+      ])],
+      ["Referring Agent", omitEmptyRows([
         ["Name", agentName],
         ["Email", data.agent_email || "-"]
-      ]]
+      ])]
     ];
 
     var stacked = [
-      ["Client", [
+      ["Client", omitEmptyRows([
         ["Name", clientName],
         ["Email", data.client_email || "-"],
-        ["Phone", data.client_phone || "-"],
-        ["DOB", data.date_of_birth || "-"]
-      ]],
-      ["Address", [
+        ["Phone", formatPdfPhone(data.client_phone)],
+        ["DOB", formatPdfDob(data.date_of_birth)]
+      ])],
+      ["Address", omitEmptyRows([
         ["Street", addrLine1],
         ["City / State / Zip", cityStateZip],
         ["Country", data.address_country || "-"]
-      ]],
-      ["Identification", [
+      ])],
+      ["Identification", omitEmptyRows([
         ["Tax ID / Gov't ID", maskTax ? maskTaxIdVal(data.tax_id) : (data.tax_id || "-")],
         ["Associated Person", associatedText]
-      ]],
-      ["Employment", [
-        ["Occupation", occupation],
-        ["Employer", hasEmployer ? data.employer_name : "-"],
-        ["Employer Address", employerAddr]
-      ]],
-      ["Financial Profile", [
+      ])],
+      ["Employment", employmentRows],
+      ["Financial Profile", omitEmptyRows([
         ["Net Worth", data.net_worth || "-"],
         ["Cumulative Investments", data.cumulative_investments || "-"],
         ["Annual Income", data.annual_income || "-"],
         ["Years Experience", (data.years_experience !== undefined && data.years_experience !== "") ? data.years_experience : "-"]
-      ]],
-      ["Investment Profile", [
+      ])],
+      ["Investment Profile", omitEmptyRows([
         ["Objectives", pdfJoinList(data.investment_objectives, data.other_objective)],
         ["Previous Investment Types", pdfJoinList(data.previous_investment_types)],
         ["Sophistication", pdfJoinList(data.client_sophistication, data.sophistication_other)]
-      ]],
-      ["Suitability", [
+      ])],
+      ["Suitability", omitEmptyRows([
         ["Private equity/debt (past 5 yrs)", pdfYesNoVal(data.q_private_equity_five_years)],
         ["Can invest w/ limited liquidity need", pdfYesNoVal(data.q_illiquid_investments)],
         ["Risk tolerance for private securities", pdfYesNoVal(data.q_risk_tolerance)],
         ["Capable of independent judgement", pdfYesNoVal(data.q_independent_judgement)]
-      ]],
-      ["Attestation", [
+      ])],
+      ["Attestation", omitEmptyRows([
         ["Attestation", attestationText]
-      ]]
+      ])]
     ];
     return { topRow: topRow, stacked: stacked };
   }
@@ -1383,12 +1543,14 @@ __HEADER__
       doc.setFontSize(fontSize);
       doc.setTextColor(PDF_GREY[0], PDF_GREY[1], PDF_GREY[2]);
       doc.text(String(label), x, y + fontSize * 0.8);
+
+      var fit = fitPdfValueLines(doc, value, valueW, fontSize);
       doc.setFont("helvetica", "normal");
+      doc.setFontSize(fit.fontSize);
       doc.setTextColor(PDF_NAVY[0], PDF_NAVY[1], PDF_NAVY[2]);
-      var lines = doc.splitTextToSize(String(value), valueW);
-      doc.text(lines, x + labelW, y + fontSize * 0.8);
-      var lineCount = Array.isArray(lines) ? lines.length : 1;
-      y += Math.max(fontSize * 0.8 + 2, lineCount * (fontSize * 1.15)) + 3;
+      doc.text(fit.lines, x + labelW, y + fontSize * 0.8);
+      var lineCount = fit.lines.length;
+      y += Math.max(fontSize * 0.8 + 2, lineCount * (fit.fontSize * 1.15)) + 3;
     });
     return y;
   }
@@ -1456,9 +1618,15 @@ __HEADER__
     return result.doc;
   }
 
-  function buildCefPdfFilename(data, submissionId) {
-    var ref = (data.client_last_name || data.client_first_name || "Client").replace(/[^A-Za-z0-9_-]+/g, "") || "Client";
-    return "CEF-" + ref + "-" + String(submissionId || "").slice(0, 8) + ".pdf";
+  function buildCefPdfFilename(data) {
+    var clientName = sanitizeFilenamePart(((data.client_first_name || "") + " " + (data.client_last_name || "")).trim()) || "Client";
+    var agentName = sanitizeFilenamePart(((data.agent_first_name || "") + " " + (data.agent_last_name || "")).trim()) || "Agent";
+    var employer = String(data.employer_name || "").trim();
+    var hasEmployer = !!(employer && employer.toUpperCase() !== "NONE");
+    var segments = ["CEF-" + clientName];
+    if (hasEmployer) { segments.push(sanitizeFilenamePart(employer)); }
+    segments.push(agentName);
+    return segments.join(" - ") + ".pdf";
   }
 
   qs("#submit-btn").addEventListener("click", function () {
@@ -1481,7 +1649,7 @@ __HEADER__
         payload.pdf_rms_b64 = arrayBufferToBase64(rmsDoc.output("arraybuffer"));
         payload.pdf_broker_b64 = arrayBufferToBase64(brokerDoc.output("arraybuffer"));
         brokerPdfDoc = brokerDoc;
-        brokerPdfFilename = buildCefPdfFilename(payload, draftId);
+        brokerPdfFilename = buildCefPdfFilename(payload);
       } catch (e) {
         brokerPdfDoc = null;
         brokerPdfFilename = null;
@@ -2076,7 +2244,7 @@ GLEN_NOTE_TEXTS = {
     7: "Glen: It's not possible to have more than one net worth, so I switched these from check-all-that-apply to single-choice dropdowns. Same for annual income. One clean answer per question.",
     8: "Glen: If a client selects NONE OF THE ABOVE for net worth or investments, they see an immediate eligibility warning and the submission is flagged in the admin view — we catch unqualified clients at the door instead of after the paperwork.",
     9: "Glen: Everything on this form is validated the moment it's typed, and the whole thing is re-checked on our server before it's stored — so what lands in the database is complete, consistent, and correctly attributed on the first pass.",
-    10: "Glen: On submit, the client sees our thank-you screen while two emails go out automatically: the referring broker instantly receives a clean one-page PDF of the engagement form (sensitive identifiers masked, no ID documents), and the RMS team receives the complete PDF plus any identity documents. Nobody types anything into the CRM, and the broker never handles the client's ID. For this demo, the PDF also downloads right here in the browser so you can see it immediately.",
+    10: "Glen: On submit, the client sees our thank-you screen while two emails go out automatically: the referring broker instantly receives a clean one-page PDF of the engagement form (sensitive identifiers masked, no ID documents), and the RMS team receives the complete PDF plus any identity documents. Nobody types anything into the CRM, and the broker never handles the client's ID. For this demo, the PDF also downloads right here in the browser so you can see it immediately. Question for you: want a client signature on this? I can add a draw-to-sign box (finger or mouse) right at the attestation, and the signature prints on the PDF — or a simpler typed-name signature. Say the word.",
 }
 
 # Each entry: (note number, unique anchor substring already present in
@@ -3460,10 +3628,36 @@ def decode_valid_pdf(b64_value):
     return decoded
 
 
-def store_submission_pdf(submission_id, variant, pdf_bytes):
+def sanitize_pdf_filename_part(value):
+    return re.sub(r'[\\/:*?"<>|]+', "", str(value or "")).strip()
+
+
+def build_pdf_friendly_filename(item):
+    client_name = sanitize_pdf_filename_part(
+        f"{item.get('client_first_name', '')} {item.get('client_last_name', '')}".strip()
+    ) or "Client"
+    agent_name = sanitize_pdf_filename_part(
+        f"{item.get('agent_first_name', '')} {item.get('agent_last_name', '')}".strip()
+    ) or "Agent"
+    employer = str(item.get("employer_name", "")).strip()
+    has_employer = bool(employer) and employer.upper() != "NONE"
+    segments = [f"CEF-{client_name}"]
+    if has_employer:
+        segments.append(sanitize_pdf_filename_part(employer))
+    segments.append(agent_name)
+    return " - ".join(segments) + ".pdf"
+
+
+def store_submission_pdf(submission_id, variant, pdf_bytes, friendly_filename):
     key = f"pdfs/{submission_id}-{variant}.pdf"
     try:
-        s3.put_object(Bucket=BUCKET_NAME, Key=key, Body=pdf_bytes, ContentType="application/pdf")
+        s3.put_object(
+            Bucket=BUCKET_NAME,
+            Key=key,
+            Body=pdf_bytes,
+            ContentType="application/pdf",
+            ContentDisposition=f'attachment; filename="{friendly_filename}"',
+        )
         return key
     except ClientError:
         print(f"route=submit status=pdf_s3_failed submission_id={submission_id} variant={variant}")
@@ -3545,14 +3739,15 @@ def handle_submit(body, ip, host):
     # only validates and stores what it sent, never regenerates anything.
     pdf_broker_bytes = decode_valid_pdf(body.get("pdf_broker_b64"))
     pdf_rms_bytes = decode_valid_pdf(body.get("pdf_rms_b64"))
+    pdf_friendly_filename = build_pdf_friendly_filename(item)
 
     pdf_keys = {}
     if pdf_broker_bytes:
-        key = store_submission_pdf(submission_id, "broker", pdf_broker_bytes)
+        key = store_submission_pdf(submission_id, "broker", pdf_broker_bytes, pdf_friendly_filename)
         if key:
             pdf_keys["pdf_broker_s3_key"] = key
     if pdf_rms_bytes:
-        key = store_submission_pdf(submission_id, "rms", pdf_rms_bytes)
+        key = store_submission_pdf(submission_id, "rms", pdf_rms_bytes, pdf_friendly_filename)
         if key:
             pdf_keys["pdf_rms_s3_key"] = key
 
