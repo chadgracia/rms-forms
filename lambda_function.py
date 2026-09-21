@@ -29,6 +29,9 @@ FORM_HOST_ENV_VAR = "FORM_HOST"
 FORM_TYPE_CEF_NATURAL = "cef-natural"
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 RATE_LIMIT_PER_HOUR = 20
+AGENT_SEARCH_RATE_LIMIT_PER_HOUR = 60
+AGENT_SEARCH_MIN_QUERY_LEN = 3
+AGENT_SEARCH_MAX_RESULTS = 5
 DRAFT_STATUS_PARTIAL = "partial"
 SUBMISSION_STATUS_COMPLETE = "complete"
 DRAFT_MAX_BYTES = 50 * 1024
@@ -498,6 +501,10 @@ def build_agent_roster_js_map():
     return json.dumps(entries)
 
 
+def build_ops_fallback_js():
+    return json.dumps({"first": OPS_FALLBACK_FIRST, "last": OPS_FALLBACK_LAST, "email": OPS_FALLBACK_EMAIL})
+
+
 NET_WORTH_SELECT_HTML = build_select_options_html(NET_WORTH_OPTIONS, "Select…")
 CUMULATIVE_SELECT_HTML = build_select_options_html(NET_WORTH_OPTIONS, "Select…")
 ANNUAL_INCOME_SELECT_HTML = build_select_options_html(ANNUAL_INCOME_OPTIONS, "Select…")
@@ -507,6 +514,7 @@ PREVIOUS_INVESTMENT_CHECKS_HTML = build_checkbox_options_html("previous_investme
 SOPHISTICATION_CHECKS_HTML = build_checkbox_options_html("client_sophistication", SOPHISTICATION_OPTIONS)
 COUNTRY_OPTIONS_HTML = build_country_options_html()
 AGENT_ROSTER_JS_MAP = build_agent_roster_js_map()
+OPS_FALLBACK_JS = build_ops_fallback_js()
 RETIRING_RADIOS_HTML = build_yesno_radios("retiring_five_years")
 Q1_RADIOS_HTML = build_yesno_radios("q_private_equity_five_years")
 Q2_RADIOS_HTML = build_yesno_radios("q_illiquid_investments")
@@ -570,6 +578,7 @@ __HEADER__
               <input type="text" id="agent_search" autocomplete="off" placeholder="Type the first or last name of the agent who referred you here.">
               <ul class="agent-suggestions" id="agent_suggestions" style="display:none;"></ul>
             </div>
+            <div class="helper-text">Type at least the first three letters of your agent's first or last name.</div>
             <div class="field" id="agent-email-display-wrap" style="display:none; margin-top:10px;">
               <label class="field-label" for="agent_email_display">Agent email (for your records)</label>
               <input type="text" id="agent_email_display" class="agent-email-display" readonly disabled>
@@ -864,7 +873,7 @@ __HEADER__
 (function () {
   "use strict";
 
-  var AGENT_ROSTER_MAP = __AGENT_ROSTER_JS_MAP__;
+  var OPS_FALLBACK = __OPS_FALLBACK_JSON__;
 
   var STEP_OF_FIELD = {
     confirm_read: 1, agent_roster: 1, agent_first_name: 1, agent_last_name: 1, agent_email: 1,
@@ -1257,7 +1266,9 @@ __HEADER__
 
     // Raw link (no ?agent=): show the type-ahead agent search, hide the
     // free-text fields until "My agent is not listed" is chosen or a
-    // roster match is picked.
+    // roster match is picked. The roster itself never ships to the
+    // browser — matches are looked up from the server as the client
+    // types (debounced, 3+ characters only).
     var rosterWrap = qs("#agent-roster-wrap");
     var manualNames = qs("#agent-manual-names");
     var emailWrap = qs("#agent-email-wrap");
@@ -1265,27 +1276,19 @@ __HEADER__
     var suggestionsList = qs("#agent_suggestions");
     var emailDisplayWrap = qs("#agent-email-display-wrap");
     var emailDisplay = qs("#agent_email_display");
-    var rosterNames = Object.keys(AGENT_ROSTER_MAP).filter(function (k) { return k !== "__none__"; });
 
     rosterWrap.style.display = "block";
     manualNames.style.display = "none";
     emailWrap.style.display = "none";
 
+    var searchDebounceTimer = null;
+    var searchRequestId = 0;
+    var lastFetchedQuery = null;
+    var lastFetchedMatches = null;
+
     function hideSuggestions() { suggestionsList.style.display = "none"; }
 
-    function renderSuggestions(query) {
-      var q = query.trim().toLowerCase();
-      var matches = q ? rosterNames.filter(function (name) {
-        var r = AGENT_ROSTER_MAP[name];
-        return r.first.toLowerCase().indexOf(q) !== -1 || r.last.toLowerCase().indexOf(q) !== -1 || name.toLowerCase().indexOf(q) !== -1;
-      }) : rosterNames;
-      suggestionsList.innerHTML = "";
-      matches.forEach(function (name) {
-        var li = document.createElement("li");
-        li.textContent = name;
-        li.addEventListener("mousedown", function (e) { e.preventDefault(); selectAgent(name); });
-        suggestionsList.appendChild(li);
-      });
+    function appendSpecialOptions() {
       var noneLi = document.createElement("li");
       noneLi.className = "agent-suggestion-special";
       noneLi.textContent = "No referring agent";
@@ -1293,17 +1296,77 @@ __HEADER__
       suggestionsList.appendChild(noneLi);
       var manualLi = document.createElement("li");
       manualLi.className = "agent-suggestion-special";
-      manualLi.textContent = "My agent is not listed";
+      manualLi.textContent = "My agent is not listed (enter manually)";
       manualLi.addEventListener("mousedown", function (e) { e.preventDefault(); selectAgent("__manual__"); });
       suggestionsList.appendChild(manualLi);
+    }
+
+    function renderSuggestions(matches) {
+      suggestionsList.innerHTML = "";
+      matches.forEach(function (match) {
+        var li = document.createElement("li");
+        li.textContent = match.name;
+        li.addEventListener("mousedown", function (e) { e.preventDefault(); selectAgent(match); });
+        suggestionsList.appendChild(li);
+      });
+      appendSpecialOptions();
       suggestionsList.style.display = "block";
     }
 
-    function selectAgent(key) {
-      agentSelectionKey = key;
+    function renderSearching() {
+      suggestionsList.innerHTML = "";
+      var li = document.createElement("li");
+      li.className = "agent-suggestion-special";
+      li.textContent = "Searching…";
+      suggestionsList.appendChild(li);
+      suggestionsList.style.display = "block";
+    }
+
+    function fetchMatches(q, requestId) {
+      renderSearching();
+      fetch("/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "agent_search", q: q, website: qs("#website").value })
+      }).then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (requestId !== searchRequestId) { return; }
+          var matches = (data && data.matches) || [];
+          lastFetchedQuery = q;
+          lastFetchedMatches = matches;
+          renderSuggestions(matches);
+        })
+        .catch(function () {
+          if (requestId !== searchRequestId) { return; }
+          lastFetchedQuery = q;
+          lastFetchedMatches = [];
+          renderSuggestions([]);
+        });
+    }
+
+    function scheduleSearch() {
+      if (searchDebounceTimer) { clearTimeout(searchDebounceTimer); searchDebounceTimer = null; }
+      searchRequestId++;
+      var q = searchInput.value.trim().toLowerCase();
+      if (q.length < 3) {
+        lastFetchedQuery = null;
+        lastFetchedMatches = null;
+        renderSuggestions([]);
+        return;
+      }
+      if (lastFetchedQuery === q && lastFetchedMatches) {
+        renderSuggestions(lastFetchedMatches);
+        return;
+      }
+      var requestId = searchRequestId;
+      searchDebounceTimer = setTimeout(function () { fetchMatches(q, requestId); }, 250);
+    }
+
+    function selectAgent(selection) {
       clearFieldError("agent_roster");
       hideSuggestions();
-      if (key === "__manual__") {
+      if (selection === "__manual__") {
+        agentSelectionKey = "__manual__";
         searchInput.value = "";
         emailDisplayWrap.style.display = "none";
         manualNames.style.display = "flex";
@@ -1318,17 +1381,23 @@ __HEADER__
       }
       manualNames.style.display = "none";
       emailWrap.style.display = "none";
-      var resolved = AGENT_ROSTER_MAP[key];
-      searchInput.value = key === "__none__" ? "No referring agent" : key;
-      qs("#agent_first_name").value = resolved ? resolved.first : "";
-      qs("#agent_last_name").value = resolved ? resolved.last : "";
-      qs("#agent_email").value = resolved ? resolved.email : "";
-      if (resolved) {
-        emailDisplay.value = resolved.email;
+      if (selection === "__none__") {
+        agentSelectionKey = "__none__";
+        searchInput.value = "No referring agent";
+        qs("#agent_first_name").value = OPS_FALLBACK.first;
+        qs("#agent_last_name").value = OPS_FALLBACK.last;
+        qs("#agent_email").value = OPS_FALLBACK.email;
+        emailDisplay.value = OPS_FALLBACK.email;
         emailDisplayWrap.style.display = "block";
-      } else {
-        emailDisplayWrap.style.display = "none";
+        return;
       }
+      agentSelectionKey = selection.name;
+      searchInput.value = selection.name;
+      qs("#agent_first_name").value = selection.first;
+      qs("#agent_last_name").value = selection.last;
+      qs("#agent_email").value = selection.email;
+      emailDisplay.value = selection.email;
+      emailDisplayWrap.style.display = "block";
     }
 
     searchInput.addEventListener("input", function () {
@@ -1339,9 +1408,9 @@ __HEADER__
       qs("#agent_first_name").value = "";
       qs("#agent_last_name").value = "";
       qs("#agent_email").value = "";
-      renderSuggestions(searchInput.value);
+      scheduleSearch();
     });
-    searchInput.addEventListener("focus", function () { renderSuggestions(searchInput.value); });
+    searchInput.addEventListener("focus", function () { scheduleSearch(); });
     searchInput.addEventListener("blur", function () { hideSuggestions(); });
   }
   initReferringAgent();
@@ -1540,7 +1609,7 @@ def render_form_page():
     page = page.replace("__SHARED_CSS__", SHARED_CSS)
     page = page.replace("__HEADER__", SHARED_HEADER)
     page = page.replace("__COUNTRY_OPTIONS__", COUNTRY_OPTIONS_HTML)
-    page = page.replace("__AGENT_ROSTER_JS_MAP__", AGENT_ROSTER_JS_MAP)
+    page = page.replace("__OPS_FALLBACK_JSON__", OPS_FALLBACK_JS)
     page = page.replace("__RETIRING_RADIOS__", RETIRING_RADIOS_HTML)
     page = page.replace("__OCCUPATION_OPTIONS__", OCCUPATION_OPTIONS_HTML)
     page = page.replace("__NET_WORTH_SELECT__", NET_WORTH_SELECT_HTML)
@@ -1569,7 +1638,7 @@ ADMIN_PAGE_RENDERED = ADMIN_PAGE_TEMPLATE.replace("__SHARED_CSS__", SHARED_CSS).
 
 GLEN_NOTE_TEXTS = {
     1: "Glen: You're viewing the annotated version — these margin notes appear only on this private preview link. Clients see a clean form with none of this.",
-    2: "Glen: Two paths, both foolproof: each agent gets a personal link that pre-fills and locks their name — and if a raw link circulates, the client picks the agent from the official roster instead of typing. Either way, every submission arrives correctly attributed. No more blank, misspelled, or unknown agent fields. If the client selects 'No referring agent', the form auto-routes to ops@rainmakersecurities.com — nothing lands unassigned.",
+    2: "Glen: Two paths, both foolproof: each agent gets a personal link that pre-fills and locks their name — and if a raw link circulates, the client picks the agent from the official roster instead of typing. Either way, every submission arrives correctly attributed. No more blank, misspelled, or unknown agent fields. If the client selects 'No referring agent', the form auto-routes to ops@rainmakersecurities.com — nothing lands unassigned. One more safeguard: the agent roster never travels to the client's browser. The page asks our server only after three letters are typed and returns a handful of matches — a client can find their own agent, but can never browse or extract our broker list.",
     3: "Glen: The text at left describes the end state; the upload itself is switched off until RMS confirms where these documents should live. The design is worth the wait: the ID gets encrypted in the client's browser with an RMS-held key, so it lands in storage as ciphertext that only RMS compliance can open — I can't see it, and no other agent can either. My recommendation: we stop emailing ID copies to referring brokers entirely, as happens today. The broker receives the engagement form data; the ID goes to RMS only. Fewer copies of passports sitting in fewer inboxes. Moving the ID to the very end is deliberate best practice: clients invest ten minutes before facing the highest-friction ask, so completion goes up — and because we now save progress step by step, we capture the client's details and see exactly where people drop out before the ID, instead of losing them entirely.",
     4: "Glen: Country now comes first and drives the rest: US clients get a proper state dropdown, the form pre-populates city and state from the zip code, and zip code errors are disallowed at entry. Bad addresses can no longer reach us.",
     5: "Glen: Every identification field is now required and format-checked before the client can advance — fewer incomplete forms, fewer repeat requests back to the client.",
@@ -2171,6 +2240,57 @@ def check_rate_limit(ip):
     except ClientError:
         return True
     return count <= RATE_LIMIT_PER_HOUR
+
+
+def check_agent_search_rate_limit(ip):
+    # Separate, more generous budget from the submission rate limit above —
+    # typing in the agent search box must never be able to lock a client
+    # out of submitting the form.
+    hour_bucket = datetime.datetime.utcnow().strftime("%Y%m%d%H")
+    rl_key = f"agentsearch#{ip}#{hour_bucket}"
+    try:
+        resp = table.update_item(
+            Key={"submission_id": rl_key},
+            UpdateExpression="ADD submission_count :incr",
+            ExpressionAttributeValues={":incr": 1},
+            ReturnValues="UPDATED_NEW",
+        )
+        count = int(resp["Attributes"]["submission_count"])
+    except ClientError:
+        return True
+    return count <= AGENT_SEARCH_RATE_LIMIT_PER_HOUR
+
+
+# ---------------------------------------------------------------------------
+# Agent search (server-side type-ahead — the roster never ships to the
+# client; only the handful of entries matching a 3+ character query do)
+# ---------------------------------------------------------------------------
+
+def handle_agent_search(body, ip):
+    if str(body.get("website", "")).strip():
+        print("route=agent_search status=honeypot")
+        return response_json({"matches": []})
+
+    if not check_agent_search_rate_limit(ip):
+        print("route=agent_search status=429")
+        return response_json({"ok": False, "error": "rate_limited", "matches": []}, 429)
+
+    q = str(body.get("q", "")).strip()
+    if len(q) < AGENT_SEARCH_MIN_QUERY_LEN:
+        print("route=agent_search status=200")
+        return response_json({"matches": []})
+
+    q_lower = q.lower()
+    matches = []
+    for display_name, email in AGENT_ROSTER:
+        first, last = split_agent_display_name(display_name)
+        if first.lower().startswith(q_lower) or last.lower().startswith(q_lower):
+            matches.append({"name": display_name, "first": first, "last": last, "email": email})
+            if len(matches) >= AGENT_SEARCH_MAX_RESULTS:
+                break
+
+    print("route=agent_search status=200")
+    return response_json({"matches": matches})
 
 
 # ---------------------------------------------------------------------------
@@ -2997,6 +3117,8 @@ def lambda_handler(event, context):
                 return handle_submit(body, ip, host)
             if action == "draft":
                 return handle_draft(body, ip)
+            if action == "agent_search":
+                return handle_agent_search(body, ip)
             print("route=unknown_action status=400")
             return response_json({"ok": False, "error": "unknown_action"}, 400)
 
