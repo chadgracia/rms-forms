@@ -855,6 +855,7 @@ __HEADER__
     <div class="success-check">&#10003;</div>
     <h2>Thank you. Your Client Engagement Form has been submitted.</h2>
     <p>Reference ID: <span id="success-id"></span></p>
+    <p><button type="button" class="btn" id="download-pdf-btn" style="display:none;">Download PDF Copy</button></p>
   </div>
 
 </div>
@@ -1130,6 +1131,22 @@ __HEADER__
     return data;
   }
 
+  function downloadBase64Pdf(b64, filename) {
+    var byteChars = atob(b64);
+    var byteNumbers = new Array(byteChars.length);
+    for (var i = 0; i < byteChars.length; i++) { byteNumbers[i] = byteChars.charCodeAt(i); }
+    var byteArray = new Uint8Array(byteNumbers);
+    var blob = new Blob([byteArray], { type: "application/pdf" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = filename || "CEF.pdf";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  }
+
   qs("#submit-btn").addEventListener("click", function () {
     if (!validateStep3()) { focusAndScroll(firstInvalidField()); return; }
     var btn = qs("#submit-btn");
@@ -1148,6 +1165,13 @@ __HEADER__
           qs("#form-wrap").style.display = "none";
           qs("#success-screen").style.display = "block";
           qs("#success-id").textContent = res.body.submission_id;
+          if (res.body.pdf_b64) {
+            var downloadBtn = qs("#download-pdf-btn");
+            downloadBtn.style.display = "inline-block";
+            downloadBtn.onclick = function () {
+              downloadBase64Pdf(res.body.pdf_b64, res.body.pdf_filename);
+            };
+          }
           window.scrollTo({ top: 0, behavior: "smooth" });
         } else if (res.body && res.body.errors && Object.keys(res.body.errors).length) {
           clearAllErrors();
@@ -1553,7 +1577,7 @@ GLEN_NOTE_TEXTS = {
     7: "Glen: It's not possible to have more than one net worth, so I switched these from check-all-that-apply to single-choice dropdowns. Same for annual income. One clean answer per question.",
     8: "Glen: If a client selects NONE OF THE ABOVE for net worth or investments, they see an immediate eligibility warning and the submission is flagged in the admin view — we catch unqualified clients at the door instead of after the paperwork.",
     9: "Glen: Everything on this form is validated the moment it's typed, and the whole thing is re-checked on our server before it's stored — so what lands in the database is complete, consistent, and correctly attributed on the first pass.",
-    10: "Glen: On submit, the client sees our thank-you screen while two emails go out automatically: the referring broker instantly receives a clean one-page PDF of the engagement form (sensitive identifiers masked, no ID documents), and the RMS team receives the complete PDF plus any identity documents. Nobody types anything into the CRM, and the broker never handles the client's ID.",
+    10: "Glen: On submit, the client sees our thank-you screen while two emails go out automatically: the referring broker instantly receives a clean one-page PDF of the engagement form (sensitive identifiers masked, no ID documents), and the RMS team receives the complete PDF plus any identity documents. Nobody types anything into the CRM, and the broker never handles the client's ID. For this demo, the PDF also downloads right here in the browser so you can see it immediately.",
 }
 
 # Each entry: (note number, unique anchor substring already present in
@@ -1648,6 +1672,18 @@ def response_json(obj, status=200):
         "headers": {"Content-Type": "application/json"},
         "body": json.dumps(obj),
         "isBase64Encoded": False,
+    }
+
+
+def response_pdf(pdf_bytes, filename, status=200):
+    return {
+        "statusCode": status,
+        "headers": {
+            "Content-Type": "application/pdf",
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+        "body": base64.b64encode(pdf_bytes).decode("ascii"),
+        "isBase64Encoded": True,
     }
 
 
@@ -2370,6 +2406,12 @@ def build_cef_pdf(item, mask_tax_id=False):
     return bytes(pdf.output())
 
 
+def build_cef_pdf_filename(item, submission_id):
+    client_ref = item.get("client_last_name") or item.get("client_first_name") or "Client"
+    client_ref = re.sub(r"[^A-Za-z0-9_-]+", "", str(client_ref)) or "Client"
+    return f"CEF-{client_ref}-{str(submission_id)[:8]}.pdf"
+
+
 # ---------------------------------------------------------------------------
 # Submission emails (Part C): broker copy (masked) + RMS copy (full + ID)
 # ---------------------------------------------------------------------------
@@ -2382,7 +2424,7 @@ def _fetch_id_document(s3_key):
         return None
 
 
-def send_submission_emails(item, submission_id, host):
+def send_submission_emails(item, submission_id, host, broker_pdf=None):
     client_first = item.get("client_first_name", "")
     client_last = item.get("client_last_name", "")
     client_ref = client_last or client_first or "Client"
@@ -2393,7 +2435,7 @@ def send_submission_emails(item, submission_id, host):
     #    no ID documents.
     if agent_email and agent_email.lower().endswith(AGENT_EMAIL_DOMAIN):
         try:
-            broker_pdf = build_cef_pdf(item, mask_tax_id=True)
+            broker_pdf = broker_pdf if broker_pdf is not None else build_cef_pdf(item, mask_tax_id=True)
             msg = MIMEMultipart()
             msg["Subject"] = f"New Client Engagement Form: {client_first} {client_last}".strip()
             msg["From"] = SES_SENDER
@@ -2409,7 +2451,7 @@ def send_submission_emails(item, submission_id, host):
             msg.attach(MIMEText(body_text, "plain"))
             attachment = MIMEApplication(broker_pdf, _subtype="pdf")
             attachment.add_header(
-                "Content-Disposition", "attachment", filename=f"CEF-{client_ref}-{submission_id[:8]}.pdf"
+                "Content-Disposition", "attachment", filename=build_cef_pdf_filename(item, submission_id)
             )
             msg.attach(attachment)
             ses.send_raw_email(RawMessage={"Data": msg.as_bytes()})
@@ -2437,7 +2479,7 @@ def send_submission_emails(item, submission_id, host):
         msg.attach(MIMEText(body_text, "plain"))
         attachment = MIMEApplication(rms_pdf, _subtype="pdf")
         attachment.add_header(
-            "Content-Disposition", "attachment", filename=f"CEF-{client_ref}-{submission_id[:8]}.pdf"
+            "Content-Disposition", "attachment", filename=build_cef_pdf_filename(item, submission_id)
         )
         msg.attach(attachment)
 
@@ -2710,10 +2752,24 @@ def handle_submit(body, ip, host):
             500,
         )
 
-    send_submission_emails(item, submission_id, host)
+    broker_pdf_bytes = None
+    pdf_b64 = None
+    pdf_filename = None
+    try:
+        broker_pdf_bytes = build_cef_pdf(item, mask_tax_id=True)
+        pdf_b64 = base64.b64encode(broker_pdf_bytes).decode("ascii")
+        pdf_filename = build_cef_pdf_filename(item, submission_id)
+    except Exception:
+        print(f"route=submit status=pdf_failed submission_id={submission_id}")
+
+    send_submission_emails(item, submission_id, host, broker_pdf=broker_pdf_bytes)
 
     print(f"route=submit status=200 submission_id={submission_id}")
-    return response_json({"ok": True, "submission_id": submission_id})
+    response_data = {"ok": True, "submission_id": submission_id}
+    if pdf_b64:
+        response_data["pdf_b64"] = pdf_b64
+        response_data["pdf_filename"] = pdf_filename
+    return response_json(response_data)
 
 
 # ---------------------------------------------------------------------------
@@ -2836,9 +2892,21 @@ def render_admin_detail(submission_id, admin_key):
         warning_html = f"<div class='eligibility-warning'>&#9888; {html.escape(ELIGIBILITY_WARNING_TEXT)}</div>"
 
     back_url = f"/?view=admin&key={quote(admin_key)}"
+    pdf_links_html = ""
+    if item.get("status") == SUBMISSION_STATUS_COMPLETE:
+        broker_pdf_url = f"/?view=pdf&key={quote(admin_key)}&id={quote(submission_id)}&variant=broker"
+        rms_pdf_url = f"/?view=pdf&key={quote(admin_key)}&id={quote(submission_id)}&variant=rms"
+        pdf_links_html = (
+            "<p>"
+            f"<a class='detail-link' href='{html.escape(broker_pdf_url)}'>Download PDF (Broker copy)</a>"
+            " &nbsp;|&nbsp; "
+            f"<a class='detail-link' href='{html.escape(rms_pdf_url)}'>Download PDF (RMS copy)</a>"
+            "</p>"
+        )
     content = (
         f"<p><a class='detail-link' href='{html.escape(back_url)}'>&larr; Back to submissions</a></p>"
         "<h1>Submission Detail</h1>"
+        f"{pdf_links_html}"
         f"{warning_html}"
         f"<div class='id-section'><h2>Identity Document</h2>{upload_html}</div>"
         f"<div class='detail-grid'>{''.join(rows_html)}</div>"
@@ -2861,6 +2929,38 @@ def handle_admin(params, host):
     return render_admin_list(supplied_key)
 
 
+def handle_admin_pdf(params, host):
+    admin_key = os.environ.get("ADMIN_KEY", "")
+    supplied_key = params.get("key", "")
+    if not admin_key or supplied_key != admin_key:
+        print("route=admin_pdf status=403")
+        return response_text("Forbidden", 403)
+
+    submission_id = params.get("id")
+    variant = params.get("variant")
+    if variant not in ("broker", "rms"):
+        print("route=admin_pdf status=400")
+        return response_text("Invalid variant", 400)
+
+    try:
+        resp = table.get_item(Key={"submission_id": submission_id})
+    except ClientError:
+        resp = {}
+    item = resp.get("Item")
+    if not item or item.get("form_type") != FORM_TYPE_CEF_NATURAL:
+        print("route=admin_pdf status=404")
+        return response_text("Not Found", 404)
+
+    if item.get("status") != SUBMISSION_STATUS_COMPLETE:
+        print(f"route=admin_pdf status=400 submission_id={submission_id}")
+        return response_text("Record incomplete", 400)
+
+    pdf_bytes = build_cef_pdf(item, mask_tax_id=(variant == "broker"))
+    filename = build_cef_pdf_filename(item, submission_id)
+    print(f"route=admin_pdf status=200 submission_id={submission_id}")
+    return response_pdf(pdf_bytes, filename)
+
+
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
@@ -2880,6 +2980,8 @@ def lambda_handler(event, context):
         if method == "GET":
             if params.get("view") == "admin":
                 return handle_admin(params, host)
+            if params.get("view") == "pdf":
+                return handle_admin_pdf(params, host)
             print("route=form status=200")
             if params.get("notes") == "glen":
                 return response_html(FORM_HTML_WITH_GLEN_NOTES)
