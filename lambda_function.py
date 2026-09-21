@@ -1931,6 +1931,21 @@ def is_blank(v):
     return v is None or (isinstance(v, str) and not v.strip())
 
 
+def dynamodb_safe(value):
+    """Recursively guarantee a value contains no Python float -- DynamoDB's
+    put_item/update_item reject the float type outright (it must be int,
+    Decimal, or str). Applied once at the item-construction boundary right
+    before every put_item call, so no upstream field-handling code has to
+    individually guarantee this on every future field it adds."""
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else str(value)
+    if isinstance(value, list):
+        return [dynamodb_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {k: dynamodb_safe(v) for k, v in value.items()}
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Presign
 # ---------------------------------------------------------------------------
@@ -2392,22 +2407,29 @@ def check_rate_limit(ip):
     return count <= RATE_LIMIT_PER_HOUR
 
 
+# In-memory, per-warm-container counter for the agent-search rate limit
+# (module-level state persists across invocations of the same Lambda
+# execution environment, the same way the boto3 clients below do). This is
+# intentionally NOT backed by DynamoDB: unlike the submission rate limit,
+# which guards against real spam records, this one only throttles a
+# read-only lookup endpoint -- a generous, convenience-only budget, not a
+# security boundary. Every keystroke-driven search used to add a DynamoDB
+# write that didn't exist before the type-ahead was moved server-side,
+# competing for the same table's write capacity as actual submissions;
+# keeping this counter in memory removes that added write pressure
+# entirely while still doing its job within a given warm container.
+_agent_search_counts = {}
+
+
 def check_agent_search_rate_limit(ip):
-    # Separate, more generous budget from the submission rate limit above —
-    # typing in the agent search box must never be able to lock a client
-    # out of submitting the form.
     hour_bucket = datetime.datetime.utcnow().strftime("%Y%m%d%H")
-    rl_key = f"agentsearch#{ip}#{hour_bucket}"
-    try:
-        resp = table.update_item(
-            Key={"submission_id": rl_key},
-            UpdateExpression="ADD submission_count :incr",
-            ExpressionAttributeValues={":incr": 1},
-            ReturnValues="UPDATED_NEW",
-        )
-        count = int(resp["Attributes"]["submission_count"])
-    except ClientError:
-        return True
+    key = (ip, hour_bucket)
+    for stale_key in [k for k in _agent_search_counts if k[1] != hour_bucket]:
+        # The hour rolled over -- drop stale buckets so a long-lived warm
+        # container doesn't accumulate counters forever.
+        del _agent_search_counts[stale_key]
+    count = _agent_search_counts.get(key, 0) + 1
+    _agent_search_counts[key] = count
     return count <= AGENT_SEARCH_RATE_LIMIT_PER_HOUR
 
 
@@ -2832,11 +2854,13 @@ def handle_draft(body, ip):
         "ip": ip,
     }
     item.update(data)
+    item = dynamodb_safe(item)
 
     try:
         table.put_item(Item=item)
-    except ClientError:
-        print(f"route=draft status=500 draft_id={draft_id}")
+    except ClientError as e:
+        error_code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        print(f"route=draft status=500 draft_id={draft_id} error={type(e).__name__}:{error_code}")
         return response_json({"ok": False, "error": "storage_failed"}, 500)
 
     print(f"route=draft status=200 draft_id={draft_id} last_step={last_step}")
@@ -3008,16 +3032,24 @@ def handle_submit(body, ip, host):
         "ip": ip,
     }
     item.update(data)
+    item = dynamodb_safe(item)
 
     try:
         table.put_item(Item=item)
-    except ClientError:
-        print(f"route=submit status=500 submission_id={submission_id}")
+    except ClientError as e:
+        # AWS's structured Error Code (e.g. "ValidationException",
+        # "ProvisionedThroughputExceededException") is a fixed, known-safe
+        # vocabulary -- unlike str(e), it never echoes request/field values,
+        # so it's always safe to log alongside the exception class name and
+        # submission_id. No form field values are ever logged here.
+        error_code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        print(f"route=submit status=500 submission_id={submission_id} error={type(e).__name__}:{error_code}")
+        ref = submission_id[:8]
         return response_json(
             {
                 "ok": False,
                 "error": "storage_failed",
-                "message": "We couldn't save your submission just now. Please try again in a moment.",
+                "message": f"We couldn't save your submission just now. Please try again in a moment. (ref: {ref})",
             },
             500,
         )
