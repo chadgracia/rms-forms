@@ -35,6 +35,20 @@ s3 = boto3.client("s3", region_name=REGION)
 ses = boto3.client("ses", region_name=REGION)
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+US_ZIP_RE = re.compile(r"^\d{5}(-\d{4})?$")
+ID_UPLOAD_STATUS_DEFERRED = "deferred-rms-secure-transfer"
+
+US_STATES = (
+    "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado",
+    "Connecticut", "Delaware", "District of Columbia", "Florida", "Georgia",
+    "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky",
+    "Louisiana", "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota",
+    "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada", "New Hampshire",
+    "New Jersey", "New Mexico", "New York", "North Carolina", "North Dakota",
+    "Ohio", "Oklahoma", "Oregon", "Pennsylvania", "Rhode Island",
+    "South Carolina", "South Dakota", "Tennessee", "Texas", "Utah", "Vermont",
+    "Virginia", "Washington", "West Virginia", "Wisconsin", "Wyoming",
+)
 
 NET_WORTH_OPTIONS = (
     "$1,000,000 - $4,999,999",
@@ -260,16 +274,13 @@ details.patriot-section { border: 1px solid #e3ded0; border-radius: 3px; padding
 details.patriot-section summary { font-weight: 700; cursor: pointer; color: var(--navy); }
 details.patriot-section p { margin: 12px 0; }
 .honeypot-field { position: absolute; left: -9999px; top: -9999px; opacity: 0; height: 0; width: 0; }
-.dropzone {
-  border: 2px dashed #ccc6b8; border-radius: 4px; padding: 28px 16px; text-align: center;
-  background: #faf9f5; margin-top: 8px;
+.id-upload-notice {
+  display: flex; align-items: center; gap: 10px; background: #faf6ee;
+  border: 1px solid var(--gold); color: var(--navy); border-radius: 4px;
+  padding: 14px 16px; margin-top: 14px; font-size: 14px; transition: box-shadow 0.15s ease;
 }
-.dropzone.dragover { border-color: var(--gold); background: #fbf4e6; }
-.upload-progress { background: #eee9dd; height: 6px; border-radius: 3px; overflow: hidden; margin-top: 14px; }
-.upload-progress-bar { background: var(--gold); height: 100%; width: 0%; transition: width 0.15s ease; }
-.upload-status { margin-top: 10px; font-size: 13px; }
-.upload-success { color: #2f7a3d; font-weight: 700; }
-.upload-error { color: #b23b3b; font-weight: 700; }
+.id-upload-notice-icon { font-size: 17px; flex-shrink: 0; }
+.id-upload-notice.highlight { box-shadow: 0 0 0 3px rgba(185, 151, 91, 0.35); }
 .nav-buttons { display: flex; justify-content: space-between; margin-top: 32px; }
 .step { display: none; }
 .step.active { display: block; }
@@ -447,21 +458,14 @@ __HEADER__
       <div class="step" data-step="2">
         <h2>Client Identification</h2>
 
-        <div class="field" data-field="id_upload_s3_key">
+        <div class="field">
           <label class="field-label">Identity Verification Upload</label>
           <p class="helper-text">Upload a government issued photo ID of the Client. If this cannot be obtained, upload a text narrative that documents the circumstances of the Client's refusal, neglect, or inability to provide the requested document. Note that if we cannot verify a Client's identity in some manner, we cannot legally transact with the Client.</p>
-          <div class="dropzone" id="dropzone">
-            <p>Drag and drop your file here, or</p>
-            <button type="button" class="btn" id="browse-btn">Browse Files</button>
-            <p class="helper-text">Accepted: JPG, PNG, PDF, HEIC — max 15MB</p>
-            <input type="file" id="file-input" accept=".jpg,.jpeg,.png,.pdf,.heic" style="display:none;">
-            <div class="upload-progress" id="upload-progress" style="display:none;">
-              <div class="upload-progress-bar" id="upload-progress-bar"></div>
-            </div>
-            <div class="upload-status" id="upload-status"></div>
+          <button type="button" class="btn" id="upload-id-btn">Upload ID Document</button>
+          <div class="id-upload-notice" id="id-upload-notice">
+            <span class="id-upload-notice-icon">&#128274;</span>
+            <span>Identity documents will be directly encrypted and transferred to RMS safekeeping only.</span>
           </div>
-          <input type="hidden" name="id_upload_s3_key" id="id_upload_s3_key">
-          <div class="field-error"></div>
         </div>
 
         <div class="two-col">
@@ -478,6 +482,11 @@ __HEADER__
         </div>
 
         <h3>Address of Client</h3>
+        <div class="field" data-field="address_country">
+          <label class="field-label" for="address_country">Country</label>
+          <select id="address_country" name="address_country">__COUNTRY_OPTIONS__</select>
+          <div class="field-error"></div>
+        </div>
         <div class="field" data-field="address_street">
           <label class="field-label" for="address_street">Street Address</label>
           <input type="text" id="address_street" name="address_street">
@@ -493,23 +502,17 @@ __HEADER__
             <input type="text" id="address_city" name="address_city">
             <div class="field-error"></div>
           </div>
-          <div class="field" data-field="address_state">
+          <div class="field" data-field="address_state" id="address_state_wrap">
             <label class="field-label" for="address_state">State/Province</label>
             <input type="text" id="address_state" name="address_state">
             <div class="field-error"></div>
           </div>
         </div>
-        <div class="two-col">
-          <div class="field" data-field="address_zip">
-            <label class="field-label" for="address_zip">Postal/Zip Code</label>
-            <input type="text" id="address_zip" name="address_zip">
-            <div class="field-error"></div>
-          </div>
-          <div class="field" data-field="address_country">
-            <label class="field-label" for="address_country">Country</label>
-            <select id="address_country" name="address_country">__COUNTRY_OPTIONS__</select>
-            <div class="field-error"></div>
-          </div>
+        <div class="field" data-field="address_zip">
+          <label class="field-label" for="address_zip">Postal/Zip Code</label>
+          <input type="text" id="address_zip" name="address_zip">
+          <div class="helper-text" id="zip-helper" style="display:none;">Format: 12345 or 12345-6789</div>
+          <div class="field-error"></div>
         </div>
 
         <div class="two-col">
@@ -701,7 +704,7 @@ __HEADER__
 
   var STEP_OF_FIELD = {
     confirm_read: 1, agent_first_name: 1, agent_last_name: 1, agent_email: 1,
-    id_upload_s3_key: 2, client_first_name: 2, client_last_name: 2,
+    client_first_name: 2, client_last_name: 2,
     address_street: 2, address_city: 2, address_state: 2, address_zip: 2, address_country: 2,
     client_phone: 2, client_email: 2, tax_id: 2, date_of_birth: 2,
     associated_person: 2, crd_number: 2,
@@ -790,13 +793,25 @@ __HEADER__
     return ok;
   }
 
+  function isUSCountry(v) { return v === "United States"; }
+
   function validateStep2() {
     var ok = true;
-    if (!qs("#id_upload_s3_key").value) { showFieldError("id_upload_s3_key", "Please upload an identity document."); ok = false; } else { clearFieldError("id_upload_s3_key"); }
-    ["client_first_name", "client_last_name", "address_street", "address_city", "address_state", "address_zip", "tax_id"].forEach(function (f) {
+    ["client_first_name", "client_last_name", "address_country", "address_street", "address_city", "tax_id"].forEach(function (f) {
       var v = qs("#" + f).value.trim();
       if (!v) { showFieldError(f, "This field is required."); ok = false; } else { clearFieldError(f); }
     });
+
+    var country = qs("#address_country").value.trim();
+
+    var stateVal = qs("#address_state").value.trim();
+    if (!stateVal) { showFieldError("address_state", "This field is required."); ok = false; } else { clearFieldError("address_state"); }
+
+    var zip = qs("#address_zip").value.trim();
+    if (!zip) { showFieldError("address_zip", "This field is required."); ok = false; }
+    else if (isUSCountry(country) && !/^\d{5}(-\d{4})?$/.test(zip)) { showFieldError("address_zip", "Enter a valid US zip code (12345 or 12345-6789)."); ok = false; }
+    else { clearFieldError("address_zip"); }
+
     var phone = qs("#client_phone").value.trim();
     var digits = phone.replace(/\\D/g, "");
     if (!phone) { showFieldError("client_phone", "This field is required."); ok = false; }
@@ -1002,83 +1017,97 @@ __HEADER__
   }
   prefillAgent();
 
-  var dropzone = qs("#dropzone");
-  var fileInput = qs("#file-input");
-  var uploadProgressWrap = qs("#upload-progress");
-  var uploadProgressBar = qs("#upload-progress-bar");
-  var uploadStatus = qs("#upload-status");
-
-  function escapeHtml(s) {
-    var div = document.createElement("div");
-    div.textContent = s;
-    return div.innerHTML;
+  var uploadIdBtn = qs("#upload-id-btn");
+  var idUploadNotice = qs("#id-upload-notice");
+  if (uploadIdBtn && idUploadNotice) {
+    uploadIdBtn.addEventListener("click", function () {
+      idUploadNotice.classList.add("highlight");
+      idUploadNotice.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      setTimeout(function () { idUploadNotice.classList.remove("highlight"); }, 1200);
+    });
   }
 
-  function showUploadError(msg) {
-    uploadStatus.innerHTML = '<span class="upload-error">' + escapeHtml(msg) + "</span>";
-    uploadProgressWrap.style.display = "none";
+  var US_STATES = [
+    "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado",
+    "Connecticut", "Delaware", "District of Columbia", "Florida", "Georgia",
+    "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky",
+    "Louisiana", "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota",
+    "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada", "New Hampshire",
+    "New Jersey", "New Mexico", "New York", "North Carolina", "North Dakota",
+    "Ohio", "Oklahoma", "Oregon", "Pennsylvania", "Rhode Island",
+    "South Carolina", "South Dakota", "Tennessee", "Texas", "Utah", "Vermont",
+    "Virginia", "Washington", "West Virginia", "Wisconsin", "Wyoming"
+  ];
+
+  function rebuildStateField(preserveValue) {
+    var old = qs("#address_state");
+    var val = preserveValue !== undefined ? preserveValue : old.value;
+    var country = qs("#address_country").value;
+    var el;
+    if (isUSCountry(country)) {
+      el = document.createElement("select");
+      var optsHtml = '<option value="">Select State</option>';
+      US_STATES.forEach(function (s) {
+        optsHtml += "<option value='" + s + "'" + (s === val ? " selected" : "") + ">" + s + "</option>";
+      });
+      el.innerHTML = optsHtml;
+    } else {
+      el = document.createElement("input");
+      el.type = "text";
+      el.value = US_STATES.indexOf(val) === -1 ? val : "";
+    }
+    el.id = "address_state";
+    el.name = "address_state";
+    old.parentNode.replaceChild(el, old);
   }
 
-  function guessContentType(ext, browserType) {
-    var map = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", pdf: "application/pdf", heic: "image/heic" };
-    return map[ext] || browserType || "application/octet-stream";
+  function updateZipHelper() {
+    qs("#zip-helper").style.display = isUSCountry(qs("#address_country").value) ? "block" : "none";
   }
 
-  function uploadFileToS3(file, url, contentType, key) {
-    uploadProgressWrap.style.display = "block";
-    uploadStatus.textContent = "Uploading...";
-    var xhr = new XMLHttpRequest();
-    xhr.open("PUT", url);
-    xhr.setRequestHeader("Content-Type", contentType);
-    xhr.upload.onprogress = function (e) {
-      if (e.lengthComputable) {
-        var pct = Math.round((e.loaded / e.total) * 100);
-        uploadProgressBar.style.width = pct + "%";
-      }
-    };
-    xhr.onload = function () {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        qs("#id_upload_s3_key").value = key;
-        uploadStatus.innerHTML = '<span class="upload-success">&#10003; ' + escapeHtml(file.name) + "</span>";
-        clearFieldError("id_upload_s3_key");
-      } else {
-        showUploadError("Upload failed. Please try again.");
-      }
-    };
-    xhr.onerror = function () { showUploadError("Upload failed. Please try again."); };
-    xhr.send(file);
-  }
-
-  function handleFile(file) {
-    var allowedExt = ["jpg", "jpeg", "png", "pdf", "heic"];
-    var parts = file.name.split(".");
-    var ext = parts.length > 1 ? parts.pop().toLowerCase() : "";
-    if (allowedExt.indexOf(ext) === -1) { showUploadError("Unsupported file type."); return; }
-    if (file.size > 15 * 1024 * 1024) { showUploadError("File exceeds 15MB limit."); return; }
-    var contentType = guessContentType(ext, file.type);
-    uploadStatus.textContent = "Requesting upload URL...";
-    fetch("/", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "presign", filename: file.name, content_type: contentType })
-    }).then(function (r) { return r.json(); })
-      .then(function (res) {
-        if (!res.ok) { showUploadError("Could not prepare upload."); return; }
-        uploadFileToS3(file, res.url, contentType, res.key);
-      }).catch(function () { showUploadError("Network error requesting upload."); });
-  }
-
-  qs("#browse-btn").addEventListener("click", function () { fileInput.click(); });
-  fileInput.addEventListener("change", function () {
-    if (fileInput.files && fileInput.files[0]) { handleFile(fileInput.files[0]); }
+  qs("#address_country").addEventListener("change", function () {
+    rebuildStateField();
+    updateZipHelper();
+    clearFieldError("address_state");
+    clearFieldError("address_zip");
   });
-  dropzone.addEventListener("dragover", function (e) { e.preventDefault(); dropzone.classList.add("dragover"); });
-  dropzone.addEventListener("dragleave", function () { dropzone.classList.remove("dragover"); });
-  dropzone.addEventListener("drop", function (e) {
-    e.preventDefault();
-    dropzone.classList.remove("dragover");
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) { handleFile(e.dataTransfer.files[0]); }
+
+  function autofillFromZip(zip) {
+    var hasAbort = typeof AbortController !== "undefined";
+    var controller = hasAbort ? new AbortController() : null;
+    var timeoutId = setTimeout(function () { if (controller) controller.abort(); }, 3000);
+    fetch("https://api.zippopotam.us/us/" + zip, controller ? { signal: controller.signal } : {})
+      .then(function (r) { if (!r.ok) throw new Error("lookup failed"); return r.json(); })
+      .then(function (data) {
+        clearTimeout(timeoutId);
+        var place = data && data.places && data.places[0];
+        if (!place) return;
+        if (place["place name"]) {
+          qs("#address_city").value = place["place name"];
+          clearFieldError("address_city");
+        }
+        if (place["state"]) {
+          var stateEl = qs("#address_state");
+          if (stateEl) {
+            stateEl.value = place["state"];
+            clearFieldError("address_state");
+          }
+        }
+      })
+      .catch(function () { clearTimeout(timeoutId); });
+  }
+
+  var zipDebounce = null;
+  qs("#address_zip").addEventListener("input", function () {
+    if (!isUSCountry(qs("#address_country").value)) return;
+    var val = qs("#address_zip").value.trim();
+    if (!/^\d{5}$/.test(val)) return;
+    if (zipDebounce) { clearTimeout(zipDebounce); }
+    zipDebounce = setTimeout(function () { autofillFromZip(val); }, 300);
   });
+
+  rebuildStateField();
+  updateZipHelper();
 
   goToStep(1);
 })();
@@ -1261,17 +1290,21 @@ def validate_submission(raw):
         errors["agent_email"] = "Enter a valid email address."
 
     # Step 2
-    upload_key = req_text("id_upload_s3_key", "Identity verification upload")
-    if upload_key and not upload_key.startswith("cef-natural/"):
-        errors["id_upload_s3_key"] = "Invalid upload reference."
+    data["id_upload_status"] = ID_UPLOAD_STATUS_DEFERRED
     req_text("client_first_name", "Client First Name")
     req_text("client_last_name", "Client Last Name")
+    country = req_text("address_country", "Country")
     req_text("address_street", "Street Address")
     opt_text("address_street2")
     req_text("address_city", "City")
-    req_text("address_state", "State/Province")
-    req_text("address_zip", "Postal/Zip Code")
-    req_text("address_country", "Country")
+
+    state = req_text("address_state", "State/Province")
+    if state and country == "United States" and state not in US_STATES:
+        errors["address_state"] = "Select a valid US state."
+
+    zip_code = req_text("address_zip", "Postal/Zip Code")
+    if zip_code and country == "United States" and not US_ZIP_RE.match(zip_code):
+        errors["address_zip"] = "Enter a valid US zip code (12345 or 12345-6789)."
 
     phone = req_text("client_phone", "Client Phone Number")
     if phone and len(re.sub(r"\D", "", phone)) < 7:
@@ -1569,7 +1602,7 @@ def render_admin_detail(submission_id, admin_key):
             f"<div class='detail-value'>{html.escape(value_str)}</div></div>"
         )
     for key, value in item.items():
-        if key in seen or key == "id_upload_s3_key":
+        if key in seen or key in ("id_upload_s3_key", "id_upload_status"):
             continue
         label = FIELD_LABELS.get(key, key.replace("_", " ").title())
         rows_html.append(
@@ -1594,6 +1627,8 @@ def render_admin_detail(submission_id, admin_key):
                 upload_html = f"<img class='id-preview' src='{html.escape(get_url)}' alt='Identity Document'>"
         except ClientError:
             upload_html = "<p>Unable to generate document link.</p>"
+    elif item.get("id_upload_status") == ID_UPLOAD_STATUS_DEFERRED:
+        upload_html = "<p>ID document: handled via RMS secure transfer</p>"
 
     back_url = f"/?view=admin&key={quote(admin_key)}"
     content = (
