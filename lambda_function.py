@@ -393,6 +393,10 @@ details.patriot-section p { margin: 12px 0; }
   border: 1px solid #c0392b; background: #fdecea; color: #c0392b; font-weight: 700;
   padding: 10px 14px; border-radius: 4px; margin-top: 8px; font-size: 13px;
 }
+.zip-mismatch {
+  border: 1px solid #c0392b; background: #fdecea; color: #c0392b; font-weight: 700;
+  padding: 10px 14px; border-radius: 4px; margin-top: 8px; font-size: 13px;
+}
 .not-eligible-tag { color: #c0392b; font-weight: 700; font-size: 11px; margin-left: 6px; white-space: nowrap; }
 .partial-tag {
   color: #8a5a00; background: #fdf3e0; border: 1px solid #c77d00; font-weight: 700;
@@ -657,6 +661,7 @@ __HEADER__
           <label class="field-label" for="address_zip">Postal/Zip Code</label>
           <input type="text" id="address_zip" name="address_zip">
           <div class="helper-text" id="zip-helper" style="display:none;">Format: 12345 or 12345-6789</div>
+          <div class="zip-mismatch" id="address-zip-mismatch" style="display:none;"></div>
           <div class="field-error"></div>
         </div>
 
@@ -748,6 +753,7 @@ __HEADER__
             <label class="field-label" for="employer_zip">Postal/Zip Code</label>
             <input type="text" id="employer_zip" name="employer_zip">
             <div class="helper-text" id="employer-zip-helper" style="display:none;">Format: 12345 or 12345-6789</div>
+            <div class="zip-mismatch" id="employer-zip-mismatch" style="display:none;"></div>
             <div class="field-error"></div>
           </div>
         </div>
@@ -891,6 +897,8 @@ __HEADER__
   var totalSteps = 3;
   var agentSelectionKey = null;
   var draftId = null;
+  var zipLookupCache = {};
+  var addressMismatchState = { address: false, employer: false };
 
   function qs(sel, root) { return (root || document).querySelector(sel); }
   function qsa(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
@@ -906,6 +914,77 @@ __HEADER__
     qs("#next-btn").style.display = n === totalSteps ? "none" : "inline-block";
     qs("#submit-btn").style.display = n === totalSteps ? "inline-block" : "none";
     window.scrollTo({ top: 0, behavior: "smooth" });
+    positionGlenNotes();
+  }
+
+  // Glen-note desktop margin layout: collision-free vertical placement.
+  // Only ?notes=glen renders any .glen-note elements at all, so this is a
+  // no-op on the normal client-facing page. On desktop each note starts at
+  // its anchor's own (browser-computed) vertical offset; this pass then
+  // walks notes top-to-bottom and pushes any note down that would overlap
+  // the one above it, drawing a thin connector line back up to the note's
+  // true anchor position when it gets pushed.
+  var glenNotesPositionScheduled = false;
+  function positionGlenNotes() {
+    var notes = qsa(".glen-note");
+    if (!notes.length) return;
+    if (glenNotesPositionScheduled) return;
+    glenNotesPositionScheduled = true;
+    requestAnimationFrame(function () {
+      glenNotesPositionScheduled = false;
+      var formWrap = qs("#form-wrap");
+      if (!formWrap) return;
+
+      if (window.innerWidth < 1100) {
+        // Mobile/inline layout: notes render in normal document flow.
+        // Undo any leftover desktop positioning/connectors from a wider
+        // viewport so a later resize back up starts clean.
+        notes.forEach(function (n) {
+          n.style.top = "";
+          var connector = n.querySelector(".glen-note-connector");
+          if (connector) { connector.parentNode.removeChild(connector); }
+        });
+        return;
+      }
+
+      var visible = notes.filter(function (n) { return n.offsetParent !== null; });
+      if (!visible.length) return;
+
+      // Reset to the browser's own hypothetical (anchor-based) position
+      // first, so every pass starts from the true, un-pushed anchor offset
+      // instead of compounding on top of a previous pass's pushed value.
+      visible.forEach(function (n) {
+        n.style.top = "";
+        var connector = n.querySelector(".glen-note-connector");
+        if (connector) { connector.parentNode.removeChild(connector); }
+      });
+
+      var formWrapTop = formWrap.getBoundingClientRect().top;
+      var items = visible.map(function (n) {
+        return { el: n, anchorTop: n.getBoundingClientRect().top - formWrapTop, height: n.offsetHeight };
+      });
+      items.sort(function (a, b) { return a.anchorTop - b.anchorTop; });
+
+      var prevBottom = null;
+      items.forEach(function (item) {
+        var top = item.anchorTop;
+        if (prevBottom !== null && top < prevBottom + 14) { top = prevBottom + 14; }
+        item.el.style.top = top + "px";
+        var pushDistance = top - item.anchorTop;
+        if (pushDistance > 0.5) {
+          var connector = document.createElement("div");
+          connector.className = "glen-note-connector";
+          connector.style.top = (-pushDistance) + "px";
+          connector.style.height = pushDistance + "px";
+          item.el.insertBefore(connector, item.el.firstChild);
+        }
+        prevBottom = top + item.height;
+      });
+    });
+  }
+  window.addEventListener("resize", function () { positionGlenNotes(); });
+  if (window.document && document.fonts && document.fonts.ready && typeof document.fonts.ready.then === "function") {
+    document.fonts.ready.then(function () { positionGlenNotes(); });
   }
 
   function fieldWrap(name) {
@@ -1002,6 +1081,8 @@ __HEADER__
     else if (isUSCountry(country) && !/^\d{5}(-\d{4})?$/.test(zip)) { showFieldError("address_zip", "Enter a valid US zip code (12345 or 12345-6789)."); ok = false; }
     else { clearFieldError("address_zip"); }
 
+    if (addressMismatchState.address) { fieldWrap("address_zip").classList.add("invalid"); ok = false; }
+
     var phone = qs("#client_phone").value.trim();
     var digits = phone.replace(/\\D/g, "");
     if (!phone) { showFieldError("client_phone", "This field is required."); ok = false; }
@@ -1048,6 +1129,8 @@ __HEADER__
     if (employerZipVisible && employerZip && !/^\d{5}(-\d{4})?$/.test(employerZip)) {
       showFieldError("employer_zip", "Enter a valid US zip code (12345 or 12345-6789)."); ok = false;
     } else { clearFieldError("employer_zip"); }
+
+    if (addressMismatchState.employer) { fieldWrap("employer_zip").classList.add("invalid"); ok = false; }
 
     var objOther = qs('input[name="investment_objectives"][value="Other"]');
     if (objOther && objOther.checked && !qs("#other_objective").value.trim()) {
@@ -1437,6 +1520,54 @@ __HEADER__
     "Virginia", "Washington", "West Virginia", "Wisconsin", "Wyoming"
   ];
 
+  // ZIP <-> City/State mismatch check (US only): a successful zippopotam
+  // lookup for a 5-digit zip is cached here (keyed by zip, shared across
+  // both address blocks) so re-checks as the client edits city/state never
+  // refetch. A failed/timed-out/never-attempted lookup simply means no
+  // cached entry -- the check silently stays out of the way; it is a
+  // convenience layered on the API, never a hard dependency on it.
+  function applyAutofillFromLookup(cfg, lookup) {
+    if (lookup.cities[0] && cfg.cityId) {
+      var cityEl = qs("#" + cfg.cityId);
+      if (cityEl) { cityEl.value = lookup.cities[0]; clearFieldError(cfg.cityId); }
+    }
+    if (lookup.state) {
+      var stateEl = qs("#" + cfg.stateId);
+      if (stateEl) { stateEl.value = lookup.state; clearFieldError(cfg.stateId); }
+    }
+  }
+
+  function checkZipMismatch(cfg) {
+    if (!cfg.zipId || !cfg.mismatchBoxId || !cfg.stateKey) return;
+    var box = qs("#" + cfg.mismatchBoxId);
+    if (!box) return;
+    var zip = qs("#" + cfg.zipId).value.trim();
+    var lookup = /^\d{5}$/.test(zip) ? zipLookupCache[zip] : null;
+    var country = qs("#" + cfg.countryId).value;
+    var cityVal = (cfg.cityId && qs("#" + cfg.cityId)) ? qs("#" + cfg.cityId).value.trim() : "";
+    var stateVal = qs("#" + cfg.stateId).value.trim();
+
+    var isMismatch = false;
+    if (isUSCountry(country) && lookup && (cityVal || stateVal)) {
+      var stateMatches = stateVal.toLowerCase() === (lookup.state || "").toLowerCase();
+      var cityMatches = lookup.cities.some(function (c) { return c.toLowerCase() === cityVal.toLowerCase(); });
+      isMismatch = !(stateMatches && cityMatches);
+    }
+
+    if (isMismatch) {
+      box.textContent = "ZIP code " + zip + " corresponds to " + lookup.cities[0] + ", " + lookup.state +
+        " — this doesn't match the city/state you entered. Please correct one of them.";
+      box.style.display = "block";
+      addressMismatchState[cfg.stateKey] = true;
+      fieldWrap(cfg.zipId).classList.add("invalid");
+    } else {
+      box.style.display = "none";
+      addressMismatchState[cfg.stateKey] = false;
+      fieldWrap(cfg.zipId).classList.remove("invalid");
+    }
+    positionGlenNotes();
+  }
+
   function autofillFromZip(zip, cfg) {
     var hasAbort = typeof AbortController !== "undefined";
     var controller = hasAbort ? new AbortController() : null;
@@ -1445,16 +1576,15 @@ __HEADER__
       .then(function (r) { if (!r.ok) throw new Error("lookup failed"); return r.json(); })
       .then(function (data) {
         clearTimeout(timeoutId);
-        var place = data && data.places && data.places[0];
-        if (!place) return;
-        if (place["place name"] && cfg.cityId) {
-          var cityEl = qs("#" + cfg.cityId);
-          if (cityEl) { cityEl.value = place["place name"]; clearFieldError(cfg.cityId); }
-        }
-        if (place["state"]) {
-          var stateEl = qs("#" + cfg.stateId);
-          if (stateEl) { stateEl.value = place["state"]; clearFieldError(cfg.stateId); }
-        }
+        var places = (data && data.places) || [];
+        if (!places.length) return;
+        var lookup = {
+          cities: places.map(function (p) { return p["place name"]; }).filter(Boolean),
+          state: places[0]["state"] || ""
+        };
+        zipLookupCache[zip] = lookup;
+        applyAutofillFromLookup(cfg, lookup);
+        checkZipMismatch(cfg);
       })
       .catch(function () { clearTimeout(timeoutId); });
   }
@@ -1485,6 +1615,8 @@ __HEADER__
       el.id = cfg.stateId;
       el.name = cfg.stateId;
       old.parentNode.replaceChild(el, old);
+      el.addEventListener("input", function () { checkZipMismatch(cfg); });
+      el.addEventListener("change", function () { checkZipMismatch(cfg); });
     }
 
     function updateZipVisibility() {
@@ -1507,14 +1639,27 @@ __HEADER__
       updateZipVisibility();
       clearFieldError(cfg.stateId);
       if (cfg.zipId) { clearFieldError(cfg.zipId); }
+      checkZipMismatch(cfg);
     });
+
+    if (cfg.cityId) {
+      var cityEl = qs("#" + cfg.cityId);
+      if (cityEl) { cityEl.addEventListener("input", function () { checkZipMismatch(cfg); }); }
+    }
 
     if (cfg.zipId) {
       var zipDebounce = null;
       qs("#" + cfg.zipId).addEventListener("input", function () {
-        if (!isUSCountry(qs("#" + cfg.countryId).value)) return;
+        if (!isUSCountry(qs("#" + cfg.countryId).value)) { checkZipMismatch(cfg); return; }
         var val = qs("#" + cfg.zipId).value.trim();
-        if (!/^\d{5}$/.test(val)) return;
+        if (!/^\d{5}$/.test(val)) { checkZipMismatch(cfg); return; }
+        var cached = zipLookupCache[val];
+        if (cached) {
+          applyAutofillFromLookup(cfg, cached);
+          checkZipMismatch(cfg);
+          return;
+        }
+        checkZipMismatch(cfg);
         if (zipDebounce) { clearTimeout(zipDebounce); }
         zipDebounce = setTimeout(function () { autofillFromZip(val, cfg); }, 300);
       });
@@ -1524,15 +1669,18 @@ __HEADER__
     updateZipVisibility();
   }
 
-  setupAddressBlock({
+  var addressCfg = {
     countryId: "address_country", stateId: "address_state", zipId: "address_zip",
-    zipHelperId: "zip-helper", cityId: "address_city", hideZipWhenNonUS: false
-  });
-  setupAddressBlock({
+    zipHelperId: "zip-helper", cityId: "address_city", hideZipWhenNonUS: false,
+    mismatchBoxId: "address-zip-mismatch", stateKey: "address"
+  };
+  var employerCfg = {
     countryId: "employer_country", stateId: "employer_state", zipId: "employer_zip",
     zipWrapId: "employer_zip_wrap", zipHelperId: "employer-zip-helper", cityId: "employer_city",
-    hideZipWhenNonUS: true
-  });
+    hideZipWhenNonUS: true, mismatchBoxId: "employer-zip-mismatch", stateKey: "employer"
+  };
+  setupAddressBlock(addressCfg);
+  setupAddressBlock(employerCfg);
 
   function hasEmployerName() {
     var v = qs("#employer_name").value.trim();
@@ -1551,6 +1699,7 @@ __HEADER__
       qs("#employer_zip").value = "";
       clearFieldError("employer_state");
       clearFieldError("employer_zip");
+      checkZipMismatch(employerCfg);
     }
   }
   qs("#employer_name").addEventListener("input", updateEmployerAddressState);
@@ -1680,6 +1829,7 @@ GLEN_NOTES_CSS = """
   .container { max-width: 1040px; }
   #form-wrap { max-width: 760px; }
   .glen-note { position: absolute; left: 100%; margin-left: 24px; width: 260px; margin-top: -4px; }
+  .glen-note-connector { position: absolute; left: 0; width: 1px; background: rgba(185, 151, 91, 0.4); }
 }
 """
 
