@@ -366,6 +366,7 @@ input.locked { background: #f3f1ea; color: #6b6a63; }
 textarea { min-height: 90px; resize: vertical; }
 label.field-label { display: block; margin: 18px 0 6px; font-weight: 700; font-size: 13px; letter-spacing: 0.2px; }
 .helper-text { font-size: 12px; color: #7a7563; margin-top: 4px; }
+.label-hint { font-weight: 400; color: #7a7563; font-size: 11.5px; margin-left: 6px; }
 .field { margin-bottom: 4px; }
 .field.invalid input, .field.invalid select, .field.invalid textarea { border-color: #b23b3b; }
 .field-error { color: #b23b3b; font-size: 12px; margin-top: 5px; display: none; }
@@ -706,7 +707,7 @@ __HEADER__
         </div>
 
         <div class="field" data-field="date_of_birth">
-          <label class="field-label" for="date_of_birth">Date of Birth</label>
+          <label class="field-label" for="date_of_birth">Date of Birth<span class="label-hint">(Must be at least 18)</span></label>
           <input type="date" id="date_of_birth" name="date_of_birth">
           <div class="field-error"></div>
         </div>
@@ -2175,6 +2176,22 @@ __HEADER__
   bindEligibilityWarning("net_worth");
   bindEligibilityWarning("cumulative_investments");
 
+  // DOB calendar range: no default value, and the picker can't navigate
+  // to or select a date younger than 18 or older than 110 years ago,
+  // computed fresh on every page load rather than hardcoded.
+  var dobInput = qs("#date_of_birth");
+  if (dobInput) {
+    var dobToday = new Date();
+    var isoDateYearsAgo = function (years) {
+      var d = new Date(dobToday.getFullYear() - years, dobToday.getMonth(), dobToday.getDate());
+      var mm = ("0" + (d.getMonth() + 1)).slice(-2);
+      var dd = ("0" + d.getDate()).slice(-2);
+      return d.getFullYear() + "-" + mm + "-" + dd;
+    };
+    dobInput.max = isoDateYearsAgo(18);
+    dobInput.min = isoDateYearsAgo(110);
+  }
+
   goToStep(1);
 })();
 </script>
@@ -2237,14 +2254,14 @@ ADMIN_PAGE_RENDERED = ADMIN_PAGE_TEMPLATE.replace("__SHARED_CSS__", SHARED_CSS).
 GLEN_NOTE_TEXTS = {
     1: "Glen: You're viewing the annotated version — these margin notes appear only on this private preview link. Clients see a clean form with none of this.",
     2: "Glen: Two paths, both foolproof: each agent gets a personal link that pre-fills and locks their name — and if a raw link circulates, the client picks the agent from the official roster instead of typing. Either way, every submission arrives correctly attributed. No more blank, misspelled, or unknown agent fields. If the client selects 'No referring agent', the form auto-routes to ops@rainmakersecurities.com — nothing lands unassigned. One more safeguard: the agent roster never travels to the client's browser. The page asks our server only after three letters are typed and returns a handful of matches — a client can find their own agent, but can never browse or extract our broker list.",
-    3: "Glen: The text at left describes the end state; the upload itself is switched off until RMS confirms where these documents should live. The design is worth the wait: the ID gets encrypted in the client's browser with an RMS-held key, so it lands in storage as ciphertext that only RMS compliance can open — I can't see it, and no other agent can either. My recommendation: we stop emailing ID copies to referring brokers entirely, as happens today. The broker receives the engagement form data; the ID goes to RMS only. Fewer copies of passports sitting in fewer inboxes. Moving the ID to the very end is deliberate best practice: clients invest ten minutes before facing the highest-friction ask, so completion goes up — and because we now save progress step by step, we capture the client's details and see exactly where people drop out before the ID, instead of losing them entirely.",
+    3: "Glen: I've researched the actual requirements — the PATRIOT Act CIP rule (31 CFR §1023.220) and SEC Reg S-P safeguards — and built the flow to adhere to them. The ID ask sits deliberately last: clients invest ten minutes first, so completion goes up, and step-by-step saving shows us exactly where anyone drops off before it. Nothing here is live: uploads stay off until RMS says where documents should live, and the data moves wherever you, the CTO, and Kirat want it to. My standing recommendation: brokers get the form, never the ID.",
     4: "Glen: Country now comes first and drives the rest: US clients get a proper state dropdown, the form pre-populates city and state from the zip code, and zip code errors are disallowed at entry. Bad addresses can no longer reach us.",
     5: "Glen: Every identification field is now required and format-checked before the client can advance — fewer incomplete forms, fewer repeat requests back to the client.",
     6: "Glen: Occupation is now a standardized dropdown with an Other option. Today we get free text — real examples from our files: 'VC', 'Real Estate', 'N/A' — which makes the data inconsistent and hard to use.",
     7: "Glen: It's not possible to have more than one net worth, so I switched these from check-all-that-apply to single-choice dropdowns. Same for annual income. One clean answer per question.",
     8: "Glen: If a client selects NONE OF THE ABOVE for net worth or investments, they see an immediate eligibility warning and the submission is flagged in the admin view — we catch unqualified clients at the door instead of after the paperwork.",
-    9: "Glen: Everything on this form is validated the moment it's typed, and the whole thing is re-checked on our server before it's stored — so what lands in the database is complete, consistent, and correctly attributed on the first pass.",
-    10: "Glen: On submit, the client sees our thank-you screen while two emails go out automatically: the referring broker instantly receives a clean one-page PDF of the engagement form (sensitive identifiers masked, no ID documents), and the RMS team receives the complete PDF plus any identity documents. Nobody types anything into the CRM, and the broker never handles the client's ID. For this demo, the PDF also downloads right here in the browser so you can see it immediately. Question for you: want a client signature on this? I can add a draw-to-sign box (finger or mouse) right at the attestation, and the signature prints on the PDF — or a simpler typed-name signature. Say the word.",
+    9: "Glen: Currently, the system just generates a PDF for Kirat. But it would be possible to have it send an email copy to anyone you like, especially the broker, with the ID stripped out. I'd be happy to work with Ken to get this to write directly to your CRM after Kirat reviews/approves and hits 'Post to CRM'.",
+    10: "Glen: On submit: the broker instantly gets a clean one-page PDF (sensitive identifiers masked, no ID), the RMS team gets the complete PDF plus any identity documents, and nobody retypes anything. For this demo the PDF also downloads right here so you can see it immediately. Want a client signature on it? I can add a draw-to-sign box at the attestation — or a simpler typed-name signature. Say the word.",
 }
 
 # Each entry: (note number, unique anchor substring already present in
